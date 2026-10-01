@@ -1,0 +1,1194 @@
+#include<bits/stdc++.h>
+#include<windows.h>
+using namespace std;
+#define hei       0
+#define lan_      1
+#define lu_       2
+#define qing_     3
+#define hong_     4
+#define zi_       5
+#define huang_    6
+#define hui       7
+#define hui_      8
+#define lan       9
+#define lu        10
+#define qing      11
+#define hong      12
+#define zi        13
+#define huang     14
+#define bai       15
+
+void setColor(int color) {
+    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+    SetConsoleTextAttribute(hOut, color);
+}
+
+void hide() {
+    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+    CONSOLE_CURSOR_INFO cursorInfo;
+    GetConsoleCursorInfo(hOut, &cursorInfo);
+    cursorInfo.bVisible = false;
+    SetConsoleCursorInfo(hOut, &cursorInfo);
+}
+
+void show() {
+    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+    CONSOLE_CURSOR_INFO cursorInfo;
+    GetConsoleCursorInfo(hOut, &cursorInfo);
+    cursorInfo.bVisible = true;
+    SetConsoleCursorInfo(hOut, &cursorInfo);
+}
+
+double li=1,bli=1;
+int way=1;
+int jmd=0;
+vector<string>start_end;
+bool flag = 0;
+struct I{
+	int x,y;
+	string s;
+};
+
+struct S{
+	string name;
+	int g;
+	int x;
+	int y;
+	string a;
+	string a1[8][8];
+	string a2[19][13];
+	string a3[6][8];
+	string a4[31][31];
+	string a5[14][13];
+	string a6[20][20];
+	string a7[15][15];
+	string a8[20][20];
+	string a9[20][20];
+	string a10[20][20];
+	string a11[20][20];
+	string a12[15][15];
+	vector<string>start_end;
+	string wd;
+	I a2npc[4];
+	I a4npc[11];
+	I a5npc[3];
+	I a6npc[2];
+	I a7npc[2];
+	I a8npc[3];
+	I a9npc[2];
+	I a10npc[4];
+	I a11npc[2];
+	I a12npc[1];
+	double li;
+	double bli;
+};
+
+vector<S>CD;
+bool CD_o=0;
+int CD_x,CD_y;
+string CD_a;
+int fang[5][2]={{0,0},{-1,0},{0,1},{1,0},{0,-1}};
+string a1[8][8],a2[19][13],a3[6][8],a4[31][31],a5[14][13];
+string wd=" ";
+I a2npc[4],a4npc[11],a5npc[3];
+
+template<size_t han,size_t lie>
+void coutt(string (&a0)[han][lie],int x,int y)
+{
+	int i,j;
+	if(CD_o)return;
+	setColor(bai);
+	system("cls");
+	
+	setColor(huang);
+	if(bli>1000)
+	{
+		cout<<"体力：∞/∞\n";
+		li=bli;
+	}
+	else 
+	{
+		printf("体力：%.1lf/%.1lf\n",li,bli);
+	}
+	cout<<"当前速度:";
+	if(way==1){
+		setColor(lu_);
+		cout<<"走路\n";
+	}
+	else if(way==2){
+		setColor(huang_);
+		cout<<"跑步\n";
+		
+	}
+	else {
+		setColor(hong_);
+		cout<<"疾跑\n";
+	}
+	setColor(bai);
+	for(i=1;i<=int(han-1);i++)
+	{
+		string s="\tcout<<\"";
+		for(j=1;j<=int(lie-1);j++)
+		{
+			if(a0[i][j]=="大"||a0[i][j]=="门"||a0[i][j]=="O") setColor(lu);
+			else if(a0[i][j]=="床") setColor(lan_);
+			else if(a0[i][j]=="柜") setColor(huang_);
+			else if(a0[i][j]=="师"||a0[i][j]=="保"||a0[i][j]=="校"||a0[i][j]=="宿") setColor(hong_);
+			else if(a0[i][j]=="我") setColor(hong);
+			else if(a0[i][j]=="享") setColor(lan_);
+			else if(a0[i][j]=="墙") setColor(bai);
+			else if(a0[i][j]=="无"||a0[i][j]=="电"||a0[i][j]=="教"||a0[i][j]=="学"||a0[i][j]=="楼"||a0[i][j]=="食"||a0[i][j]=="堂"||a0[i][j]=="男"||a0[i][j]=="女"||a0[i][j]=="生"||a0[i][j]=="舍"||a0[i][j]=="图"||a0[i][j]=="书"||a0[i][j]=="馆"||a0[i][j]=="明"||a0[i][j]=="礼"||a0[i][j]=="游"||a0[i][j]=="泳"||a0[i][j]=="体"||a0[i][j]=="育"||a0[i][j]=="办"||a0[i][j]=="公"||a0[i][j]=="室"||a0[i][j]=="二"||a0[i][j]=="层") setColor(hui_);
+			if(a0[i][j]=="宿"&&a0[i][j-1]=="生") setColor(hui_);
+			cout<<a0[i][j];
+			s+=a0[i][j];
+		}
+		setColor(bai);
+		cout<<"\n";
+	}
+}
+
+template<size_t han1,size_t lie1>
+void move(int g,string (&a0)[han1][lie1],int &x,int &y,int &an,int &c,string &a)
+{
+	if(CD_o)
+	{
+		x=CD_x;
+		y=CD_y;
+		a=CD_a;
+		CD_o=0;
+		an=1;
+		return;
+	}
+	if(GetAsyncKeyState('W')&(0x8000))
+	{
+		if(a0[x-1][y]=="  "||a0[x-1][y]=="O "||jmd==2)
+		{
+			a0[x][y]=a;
+			x--;
+			a=a0[x][y];
+			a0[x][y]="我"; 
+			an=1;
+			c--;
+			Sleep(10);
+		}
+	}
+	else if(GetAsyncKeyState('S')&(0x8000))
+	{
+		if(a0[x+1][y]=="  "||a0[x+1][y]=="O "||jmd==2)
+		{
+			a0[x][y]=a;
+			x++;
+			a=a0[x][y];
+			a0[x][y]="我"; 
+			an=1;
+			c--;
+			Sleep(10);
+		}
+	}
+	else if(GetAsyncKeyState('A')&(0x8000))
+	{
+		if(a0[x][y-1]=="  "||a0[x][y-1]=="O "||a0[x][y-1]=="床"||jmd==2)
+		{
+			a0[x][y]=a;
+			y--;
+			a=a0[x][y];
+			a0[x][y]="我"; 
+			an=1;
+			c--;
+			Sleep(10);
+		}
+	}
+	else if(GetAsyncKeyState('D')&(0x8000))
+	{
+		if(a0[x][y+1]=="  "||a0[x][y+1]=="O "||a0[x][y+1]=="床"||jmd==2)
+		{
+			a0[x][y]=a;
+			y++;
+			a=a0[x][y];
+			a0[x][y]="我"; 
+			an=1;
+			c--;
+			Sleep(10);
+		}
+	}
+	else if(GetAsyncKeyState('Q')&(0x8000))
+	{
+		if(g==0||c!=way)
+		{
+			printf("无法存档");
+			return;
+		}
+		system("cls");
+		cout<<"请输入存档名字:"; 
+		string name;
+		while(!(GetAsyncKeyState(VK_RETURN)&(0x8000)))
+		{
+			Sleep(10);
+			char i;
+			for(i='a';i<='z';i++)
+			{
+				if((GetAsyncKeyState(char(i-32))&(0x8000))&&(GetAsyncKeyState(VK_SHIFT)&(0x8000)))
+				{
+					cout<<char(i-32);
+					string ciin=" ";ciin[0]=char(i-32);
+					name+=ciin;
+					Sleep(150);
+				}
+				else if(GetAsyncKeyState(char(i-32))&(0x8000))
+				{
+					cout<<i;
+					string ciin=" ";ciin[0]=i;
+					name+=ciin;
+					Sleep(150);
+				}
+			}
+			for(i='0';i<='9';i++)
+			{
+				if(GetAsyncKeyState(i)&(0x8000))
+				{
+					cout<<i;
+					string ciin=" ";ciin[0]=i;
+					name+=ciin;
+					Sleep(150);
+				}
+			}
+			if((GetAsyncKeyState(VK_BACK)&(0x8000))&&name.size())
+			{
+				system("cls");
+				name.erase(name.size()-1);
+				cout<<"请输入存档名字:"<<name;
+				Sleep(150);
+			}
+		}
+		S s;
+	    s.name=name;
+	    s.g=g;
+	    s.x=x;
+	    s.y=y;
+	    s.a=a;
+		int i,j;
+	    for(i=1;i<=7;i++)for(j=1;j<=7;j++)s.a1[i][j]=a1[i][j];
+		for(i=1;i<=18;i++)for(j=1;j<=12;j++)s.a2[i][j]=a2[i][j];
+		for(i=1;i<=5;i++)for(j=1;j<=7;j++)s.a3[i][j]=a3[i][j];
+		for(i=1;i<=30;i++)for(j=1;j<=30;j++)s.a4[i][j]=a4[i][j];
+		for(i=1;i<=13;i++)for(j=1;j<=12;j++)s.a5[i][j]=a5[i][j];
+	    s.wd=wd;
+	    for(i=1;i<=3;i++)s.a2npc[i]=a2npc[i];
+	    for(i=1;i<=10;i++)s.a4npc[i]=a4npc[i];
+	    for(i=1;i<=2;i++)s.a5npc[i]=a5npc[i];
+	    s.li=li;
+	    s.bli=bli;
+	    s.start_end=start_end;
+	    CD.push_back(s);
+	    an=1;
+	}
+}
+
+void speed(int &s)
+{
+	if(GetAsyncKeyState(0x30+1)&(0x8000))
+	{
+		if(s==way)
+		{
+			way=s=1;
+			cout<<"已切换为走路\n";
+		}
+		else cout<<"正在运动,无法切换\n";
+		Sleep(60);
+	}
+	else if(GetAsyncKeyState(0x30+2)&(0x8000))
+	{
+		if(s==way)
+		{
+			way=s=2;
+			cout<<"已切换为跑步\n";
+		}
+		else cout<<"正在运动,无法切换\n";
+		Sleep(60);
+	}
+	else if(GetAsyncKeyState(0x30+3)&(0x8000))
+	{
+		if(s==way)
+		{
+			way=s=3;
+			cout<<"已切换为疾跑\n";
+		}
+		else cout<<"正在运动,无法切换\n";
+		Sleep(60);
+	}
+}
+
+void ready();
+int f1(int o)
+{
+	int x,y,c,s,an,i;
+	Sleep(500);
+	way=1;
+	c=1;
+	string a;
+	if(o==1)
+	{
+		x=4;
+		y=6;
+		a1[x][y]="我";
+		a="床";
+		s=70;
+		an=1;
+		while(s--)
+		{
+			move(0,a1,x,y,an,c,a);
+			if(an)
+			{
+				li=min(li+0.1,bli);
+				coutt(a1,x,y);
+				an=0;
+				if(x==6&&y==3)
+				{
+					a="无";
+					cout<<"获得1瓶饮料,体力上限+1";
+					bli++; 
+					li++;
+				} 
+				if(x==6&&y==5)
+				{
+					a="无";
+					cout<<"获得1瓶饮料,体力上限+1";
+					bli++; 
+					li++;
+				} 
+			}
+			Sleep(80);
+		}
+		a1[7][4]="宿"; 
+		coutt(a1,x,y);
+		if(x!=4||y!=6)
+		{
+			if(jmd==0){
+				cout<<"你被宿发现没有上自己的床了\n";
+				return 0;
+			}
+		}
+		Sleep(500);
+		a1[7][4]="O ";  
+		a1[6][4]="宿"; 
+		coutt(a1,x,y);
+		Sleep(500);
+		a1[6][4]="  ";  
+		a1[6][3]="宿"; 
+		coutt(a1,x,y);
+		cout<<"宿检查中...";
+		Sleep(1000);
+		a1[6][3]="无";  
+		a1[6][4]="宿"; 
+		coutt(a1,x,y);
+		Sleep(500);
+		a1[6][4]="  ";  
+		a1[6][5]="宿"; 
+		coutt(a1,x,y);
+		cout<<"宿检查中...";
+		Sleep(1000);
+		a1[6][5]="无";  
+		a1[6][4]="宿"; 
+		coutt(a1,x,y);
+		Sleep(500);
+		a1[6][4]="  "; 
+		a1[7][4]="宿"; 
+		coutt(a1,x,y);
+		Sleep(500);
+		a1[7][4]="O ";  
+	}
+	if(o==2)
+	{
+		x=6;
+		y=4;
+		a1[x][y]="我";
+		a="  ";	
+	}
+	an=1;
+	while(1)
+	{	
+		move(1,a1,x,y,an,c,a);
+		if(an)
+		{
+			li=min(li+0.1,bli);
+			coutt(a1,x,y);
+			an=0;
+		}
+		if(x==7&&y==4)
+		{
+			a1[x][y]="O ";
+			return 2;
+		} 
+		Sleep(80);
+	}
+}
+
+int f2(int o)
+{
+	int x,y,an,c,i,j;
+	string a;
+	Sleep(500);
+	a="  ";
+	if(o==1)
+	{
+		x=16;
+		y=8;
+		a2[x][y]="我";
+	}
+	if(o==3)
+	{
+		x=11;
+		y=11;
+		a2[x][y]="我";
+	}
+	an=1;
+	c=way;
+	while(1)
+	{	
+		if(c==0)
+		{
+			if(way==1)li=min(li+0.1,bli);
+			else if(way==2)li=max(0.0,li-0.5);
+			else li=max(0.0,li-1);
+			
+			for(i=1;i<=3;i++)
+			{
+				if(abs(a2npc[i].x-x)+abs(a2npc[i].y-y)-1<=3)
+				{
+					if(abs(a2npc[i].x-x)>=abs(a2npc[i].y-y)&&a2[a2npc[i].x-(a2npc[i].x-x)/(abs(a2npc[i].x-x)?abs(a2npc[i].x-x):1)][a2npc[i].y]=="  "&&a2npc[i].x-x)
+					{
+						a2[a2npc[i].x][a2npc[i].y]="  ";
+						a2npc[i].x-=(a2npc[i].x-x)/abs(a2npc[i].x-x);
+						a2[a2npc[i].x][a2npc[i].y]=a2npc[i].s;
+						li-=0.1; 
+					}
+					else if(a2[a2npc[i].x][a2npc[i].y-(a2npc[i].y-y)/(abs(a2npc[i].y-y)?abs(a2npc[i].y-y):1)]=="  "&&a2npc[i].y-y)
+					{
+						a2[a2npc[i].x][a2npc[i].y]="  ";
+						a2npc[i].y-=(a2npc[i].y-y)/abs(a2npc[i].y-y);
+						a2[a2npc[i].x][a2npc[i].y]=a2npc[i].s;
+						li-=0.1; 
+					}
+					else if(a2[a2npc[i].x-(a2npc[i].x-x)/(abs(a2npc[i].x-x)?abs(a2npc[i].x-x):1)][a2npc[i].y]=="  "&&a2npc[i].x-x)
+					{
+						a2[a2npc[i].x][a2npc[i].y]="  ";
+						a2npc[i].x-=(a2npc[i].x-x)/abs(a2npc[i].x-x);
+						a2[a2npc[i].x][a2npc[i].y]=a2npc[i].s;
+						li-=0.1; 
+					}
+				}
+				if(abs(a2npc[i].x-x)<=1&&abs(a2npc[i].y-y)<=1&&jmd==0)
+				{
+					coutt(a2,x,y);
+					cout<<"你被宿抓住了\n";
+					return 0;
+				}
+				
+			}
+			c=way;
+		}
+		if(an)
+		{
+			if(li<=0&&jmd!=2)
+			{
+				coutt(a2,x,y);
+				cout<<"你体力不足";
+				return 0;
+			} 
+			coutt(a2,x,y);
+			an=0;
+			if(x==7&&y==2)
+			{
+				wd+="宿舍门禁卡 ";
+				a="无";
+				cout<<"获得宿舍门禁卡\n"; 
+			}
+			if(x==2&&y==8)
+			{
+				wd+="体育办公室钥匙 ";
+				a="无";
+				cout<<"获得体育办公室钥匙\n"; 
+			}
+			if(c==way)cout<<"按数字键切换速度\n";
+		}
+		move(2,a2,x,y,an,c,a);
+		speed(c);
+		if(x==16&&y==9)
+		{
+			a2[x][y]="O ";
+			return 1;
+		}
+		if(x==12&&y==11)
+		{
+			a2[x][y]="O ";
+			return 3;
+		}
+		Sleep(80);
+	}
+}
+
+int f3(int o)
+{
+	int x,y,an,c;
+	string a;
+	Sleep(500);
+	way=1;
+	a="  ";
+	if(o==2)
+	{
+		x=3;
+		y=5;
+		a3[x][y]="我";
+	}
+	if(o==4)
+	{
+		x=3;
+		y=2;
+		a3[x][y]="我";
+	}
+	an=1;
+	c=1;
+	while(1)
+	{	
+		if(an)
+		{
+			if(x==3&&y==2&&a3[3][1]!="O ")
+			{
+				if(wd.find(" 宿舍门禁卡 ")!=-1)a3[3][1]="O ";
+			}
+			li=min(li+0.1,bli);
+			if(li<=0&&jmd!=2)
+			{
+				cout<<"你体力不足";
+				return 0;
+			}
+			coutt(a3,x,y);
+			if(x==3&&y==2&&a3[3][1]!="O ")cout<<"需要宿舍门禁卡\n";
+			an=0;
+		}
+		move(3,a3,x,y,an,c,a);
+		if(x==3&&y==6)
+		{
+			a3[x][y]="O ";
+			return 2;
+		}
+		if(x==3&&y==1)
+		{
+			a3[x][y]="O ";
+			return 4;
+		}
+		Sleep(80);
+	} 
+}
+
+int f4(int o)
+{
+	int x,y,an,c,i,j;
+	string a;
+	Sleep(500);
+	a="  ";
+	if(o==3)
+	{
+		x=22;
+		y=27;
+		a4[x][y]="我";
+	}
+	if(o==5)
+	{
+		x=24;
+		y=13;
+		a4[x][y]="我";
+	}
+	if(o==6)
+	{
+		x=16;
+		y=5;
+		a4[x][y]="我";
+	}
+	an=1;
+	c=way;
+	while(1)
+	{	
+		if(c==0)
+		{
+			if(way==1)li=min(li+0.1,bli);
+			else if(way==2)li=max(0.0,li-0.5);
+			else li=max(0.0,li-1);
+			
+			for(i=1;i<=10;i++)
+			{
+				if(i<=2)
+				{
+					for(j=1;j<=2;j++)
+					{
+						if(abs(a4npc[i].x-x)+abs(a4npc[i].y-y)-1<=5)
+						{
+							if(abs(a4npc[i].x-x)>=abs(a4npc[i].y-y)&&a4[a4npc[i].x-(a4npc[i].x-x)/(abs(a4npc[i].x-x)?abs(a4npc[i].x-x):1)][a4npc[i].y]=="  "&&a4npc[i].x-x)
+							{
+								if(a4[a4npc[i].x][a4npc[i].y]==a4npc[i].s)a4[a4npc[i].x][a4npc[i].y]="  ";
+								a4npc[i].x-=(a4npc[i].x-x)/abs(a4npc[i].x-x);
+								a4[a4npc[i].x][a4npc[i].y]=a4npc[i].s;
+								li-=0.05; 
+							}
+							else if(a4[a4npc[i].x][a4npc[i].y-(a4npc[i].y-y)/(abs(a4npc[i].y-y)?abs(a4npc[i].y-y):1)]=="  "&&a4npc[i].y-y)
+							{
+								if(a4[a4npc[i].x][a4npc[i].y]==a4npc[i].s)a4[a4npc[i].x][a4npc[i].y]="  ";
+								a4npc[i].y-=(a4npc[i].y-y)/abs(a4npc[i].y-y);
+								a4[a4npc[i].x][a4npc[i].y]=a4npc[i].s;
+								li-=0.05; 
+							}
+							else if(a4[a4npc[i].x-(a4npc[i].x-x)/(abs(a4npc[i].x-x)?abs(a4npc[i].x-x):1)][a4npc[i].y]=="  "&&a4npc[i].x-x)
+							{
+								if(a4[a4npc[i].x][a4npc[i].y]==a4npc[i].s)a4[a4npc[i].x][a4npc[i].y]="  ";
+								a4npc[i].x-=(a4npc[i].x-x)/abs(a4npc[i].x-x);
+								a4[a4npc[i].x][a4npc[i].y]=a4npc[i].s;
+								li-=0.05; 
+							}
+						}
+						if(abs(a4npc[i].x-x)<=1&&abs(a4npc[i].y-y)<=1&&jmd==0)
+						{
+							coutt(a4,x,y);
+							cout<<"你被保抓住了\n";
+							return 0;
+						}
+					}
+				}
+				else if(i==10&&wd.find(" 大门钥匙 ")!=-1)
+				{
+					for(j=1;j<=2;j++)
+					{
+						if(abs(a4npc[i].x-x)>=abs(a4npc[i].y-y)&&a4[a4npc[i].x-(a4npc[i].x-x)/(abs(a4npc[i].x-x)?abs(a4npc[i].x-x):1)][a4npc[i].y]=="  "&&a4npc[i].x-x)
+						{
+							if(a4[a4npc[i].x][a4npc[i].y]==a4npc[i].s)a4[a4npc[i].x][a4npc[i].y]="  ";
+							a4npc[i].x-=(a4npc[i].x-x)/abs(a4npc[i].x-x);
+							a4[a4npc[i].x][a4npc[i].y]=a4npc[i].s;
+							li-=0.05; 
+						}
+						else if(a4[a4npc[i].x][a4npc[i].y-(a4npc[i].y-y)/(abs(a4npc[i].y-y)?abs(a4npc[i].y-y):1)]=="  "&&a4npc[i].y-y)
+						{
+							if(a4[a4npc[i].x][a4npc[i].y]==a4npc[i].s)a4[a4npc[i].x][a4npc[i].y]="  ";
+							a4npc[i].y-=(a4npc[i].y-y)/abs(a4npc[i].y-y);
+							a4[a4npc[i].x][a4npc[i].y]=a4npc[i].s;
+							li-=0.05; 
+						}
+						else if(a4[a4npc[i].x-(a4npc[i].x-x)/(abs(a4npc[i].x-x)?abs(a4npc[i].x-x):1)][a4npc[i].y]=="  "&&a4npc[i].x-x)
+						{
+							if(a4[a4npc[i].x][a4npc[i].y]==a4npc[i].s)a4[a4npc[i].x][a4npc[i].y]="  ";
+							a4npc[i].x-=(a4npc[i].x-x)/abs(a4npc[i].x-x);
+							a4[a4npc[i].x][a4npc[i].y]=a4npc[i].s;
+							li-=0.05; 
+						}
+					}
+					if(abs(a4npc[i].x-x)<=1&&abs(a4npc[i].y-y)<=1&&jmd==0)
+					{
+						coutt(a4,x,y);
+						cout<<"你被校抓住了\n";
+						return 0;
+					}
+				}
+				else
+				{
+					if(abs(a4npc[i].x-x)+abs(a4npc[i].y-y)-1<=3)
+					{
+						if(abs(a4npc[i].x-x)>=abs(a4npc[i].y-y)&&a4[a4npc[i].x-(a4npc[i].x-x)/(abs(a4npc[i].x-x)?abs(a4npc[i].x-x):1)][a4npc[i].y]=="  "&&a4npc[i].x-x)
+						{
+							if(a4[a4npc[i].x][a4npc[i].y]==a4npc[i].s)a4[a4npc[i].x][a4npc[i].y]="  ";
+							a4npc[i].x-=(a4npc[i].x-x)/abs(a4npc[i].x-x);
+							a4[a4npc[i].x][a4npc[i].y]=a4npc[i].s;
+							li-=0.1; 
+						}
+						else if(a4[a4npc[i].x][a4npc[i].y-(a4npc[i].y-y)/(abs(a4npc[i].y-y)?abs(a4npc[i].y-y):1)]=="  "&&a4npc[i].y-y)
+						{
+							if(a4[a4npc[i].x][a4npc[i].y]==a4npc[i].s)a4[a4npc[i].x][a4npc[i].y]="  ";
+							a4npc[i].y-=(a4npc[i].y-y)/abs(a4npc[i].y-y);
+							a4[a4npc[i].x][a4npc[i].y]=a4npc[i].s;
+							li-=0.1; 
+						}
+						else if(a4[a4npc[i].x-(a4npc[i].x-x)/(abs(a4npc[i].x-x)?abs(a4npc[i].x-x):1)][a4npc[i].y]=="  "&&a4npc[i].x-x)
+						{
+							if(a4[a4npc[i].x][a4npc[i].y]==a4npc[i].s)a4[a4npc[i].x][a4npc[i].y]="  ";
+							a4npc[i].x-=(a4npc[i].x-x)/abs(a4npc[i].x-x);
+							a4[a4npc[i].x][a4npc[i].y]=a4npc[i].s;
+							li-=0.1; 
+						} 
+					}
+					if(abs(a4npc[i].x-x)<=1&&abs(a4npc[i].y-y)<=1&&jmd==0)
+					{
+						coutt(a4,x,y);
+						cout<<"你被师抓住了\n";
+						return 0;
+					}
+				}
+			}
+			c=way;
+		}
+		if(an)
+		{
+			if(li<=0&&jmd!=2)
+			{
+				coutt(a4,x,y);
+				cout<<"你体力不足";
+				return 0;
+			}
+			if(x==24&&y==13&&a4[25][13]!="O ")
+			{
+				if(wd.find(" 体育办公室钥匙 ")!=-1)a4[25][13]="O ";
+			}
+			if(x==16&&y==5&&a4[17][5]!="O ")
+			{
+				if(wd.find(" 图书馆钥匙 ")!=-1)a4[17][5]="O ";
+			}
+			coutt(a4,x,y);
+			if(x==24&&y==13&&a4[25][13]!="O ")cout<<"需要体育办公室钥匙\n";
+			if(x==16&&y==5&&a4[17][5]!="O ")cout<<"需要图书馆钥匙\n";
+			an=0;
+			if(c==way)cout<<"按数字键切换速度\n";
+			
+		}
+		move(4,a4,x,y,an,c,a);
+		speed(c);
+		if(x==22&&y==26)
+		{
+			a4[x][y]="O ";
+			return 3;
+		}
+		if(x==25&&y==13)
+		{
+			a4[x][y]="O ";
+			return 5;
+		}
+		if(x==17&&y==5)
+		{
+			a4[x][y]="O ";
+			return 6;
+		}
+		Sleep(80);
+	}
+}
+
+int f5(int o)
+{
+	int x,y,an,c,i;
+	string a;
+	Sleep(500);
+	a="  ";
+	x=2;
+	y=11;
+	a5[x][y]="我";
+	an=1;
+	c=way;
+	while(1)
+	{	
+		if(c==0)
+		{
+			if(way==1)li=min(li+0.1,bli);
+			else if(way==2)li=max(0.0,li-0.5);
+			else li=max(0.0,li-1);
+			
+			for(i=1;i<=2;i++)
+			{
+				if(abs(a5npc[i].x-x)+abs(a5npc[i].y-y)-1<=3)
+				{
+					if(abs(a5npc[i].x-x)>=abs(a5npc[i].y-y)&&a5[a5npc[i].x-(a5npc[i].x-x)/(abs(a5npc[i].x-x)?abs(a5npc[i].x-x):1)][a5npc[i].y]=="  "&&a5npc[i].x-x)
+					{
+						if(a5[a5npc[i].x][a5npc[i].y]==a5npc[i].s)a5[a5npc[i].x][a5npc[i].y]="  ";
+						a5npc[i].x-=(a5npc[i].x-x)/abs(a5npc[i].x-x);
+						a5[a5npc[i].x][a5npc[i].y]=a5npc[i].s;
+						li-=0.1; 
+					}
+					else if(a5[a5npc[i].x][a5npc[i].y-(a5npc[i].y-y)/(abs(a5npc[i].y-y)?abs(a5npc[i].y-y):1)]=="  "&&a5npc[i].y-y)
+					{
+						if(a5[a5npc[i].x][a5npc[i].y]==a5npc[i].s)a5[a5npc[i].x][a5npc[i].y]="  ";
+						a5npc[i].y-=(a5npc[i].y-y)/abs(a5npc[i].y-y);
+						a5[a5npc[i].x][a5npc[i].y]=a5npc[i].s;
+						li-=0.1; 
+					}
+					else if(a5[a5npc[i].x-(a5npc[i].x-x)/(abs(a5npc[i].x-x)?abs(a5npc[i].x-x):1)][a5npc[i].y]=="  "&&a5npc[i].x-x)
+					{
+						if(a5[a5npc[i].x][a5npc[i].y]==a5npc[i].s)a5[a5npc[i].x][a5npc[i].y]="  ";
+						a5npc[i].x-=(a5npc[i].x-x)/abs(a5npc[i].x-x);
+						a5[a5npc[i].x][a5npc[i].y]=a5npc[i].s;
+						li-=0.1; 
+					}
+				}
+				if(abs(a5npc[i].x-x)<=1&&abs(a5npc[i].y-y)<=1&&jmd==0)
+				{
+					coutt(a5,x,y);
+					cout<<"你被师抓住了\n";
+					return 0;
+				}
+			}
+			c=way;
+		}
+		if(an)
+		{
+			if(li<=0&&jmd!=2)
+			{
+				coutt(a5,x,y);
+				cout<<"你体力不足";
+				return 0;
+			}
+			coutt(a5,x,y);
+			an=0;
+			if(x==12&&y==2)
+			{
+				wd+="图书馆钥匙 ";
+				a="无";
+				cout<<"获得图书馆钥匙\n"; 
+			}
+			if(x==12&&y==11)
+			{
+				a="无";
+				cout<<"获得3瓶饮料,体力上限+3\n";
+				bli+=3; 
+				li+=3;
+			} 
+			if(c==way)cout<<"按数字键切换速度\n";
+		}
+		move(5,a5,x,y,an,c,a);
+		speed(c);
+		if(x==1&&y==11)
+		{
+			a5[x][y]="O ";
+			return 4;
+		}
+		Sleep(80);
+	}
+}
+
+int main()
+{
+	system("mode con cols=100 lines=40");
+	SetConsoleTitle("逃离学校-----改编版"); 
+	hide();
+	setColor(bai);
+	
+	string startt="(作者:JMD)(改编zengkeman作品)\n 彩蛋：\n1.开始前输入pl\n游戏规则：\n1.柜可以获得物品\n2.被宿,师,保,校,图书管理员,游泳教练,食堂管理员,活动组织者,校长等捉到则失败\n3.体力≤0则失败\n操作方式：\n1.使用WSAD键移动\n2.按数字键123可以切换回合移动步数\n3.按Q存档\n(此游戏纯属娱乐)\n按回车开始游戏\n";
+	string start="";
+	for(int i=0;i<startt.length();i++)
+	{
+		cout<<startt[i];
+		Sleep(10);
+	} 
+	
+	while(!(GetAsyncKeyState(VK_RETURN)&(0x8000)))
+	{
+		Sleep(10);
+		char ch;
+		for(ch='a';ch<='z';ch++)
+		{
+			if((GetAsyncKeyState(char(ch-32))&(0x8000))&&(GetAsyncKeyState(VK_SHIFT)&(0x8000)))
+			{
+				cout<<char(ch-32);
+				string ciin=" ";ciin[0]=char(ch-32);
+				start+=ciin;
+				Sleep(150);
+			}
+			else if(GetAsyncKeyState(char(ch-32))&(0x8000))
+			{
+				cout<<ch;
+				string ciin=" ";ciin[0]=ch;
+				start+=ciin;
+				Sleep(150);
+			}
+		}
+		for(ch='0';ch<='9';ch++)
+		{
+			if(GetAsyncKeyState(ch)&(0x8000))
+			{
+				cout<<ch;
+				string ciin=" ";ciin[0]=ch;
+				start+=ciin;
+				Sleep(150);
+			}
+		}
+		if((GetAsyncKeyState(VK_BACK)&(0x8000))&&start.size())
+		{
+			system("cls");
+			start.erase(start.size()-1);
+			cout<<startt<<start;
+			Sleep(150);
+		}
+	}
+	
+	if(start=="pl")
+	{
+		system("cls");
+		cout<<"你触发了重启指令，30秒后重启\n";
+		Sleep(1000);
+		system("cls");
+		jmd=1;
+		cout<<"JMD：你等到了现在，是个有耐心的人，奖励你不会被NPC抓住！\n";
+		Sleep(3000);
+	}
+	if(start=="jmd"){
+		system("cls");
+		jmd=2;
+		Sleep(1000);
+	}
+
+	while(1)
+	{
+		ready();
+		hide();
+		way=1;	
+		start_end.clear();
+		system("cls");
+		
+		int x=1,w=1,y=1;
+		bool menu_flag = true;
+		while(menu_flag) {
+			system("cls");
+			printf("1.开始游戏\n\n2.退出游戏");
+		    Sleep(150);
+		    
+		    if(!CD.empty()) {
+		        cout << "\n\n是否回档(请按Y(es)/N(o))\n";
+		        while(1) {
+		            Sleep(150);
+		            if(GetAsyncKeyState('Y') & 0x8000) {
+		                system("cls");
+		                for(int i=0; i<CD.size(); i++) cout << i+1 << "." << CD[i].name << "\n";
+		                string S = "";
+		                cout << "请选择存档：";
+		                while(!(GetAsyncKeyState(VK_RETURN) & 0x8000)) {
+		                    Sleep(150);
+		                    for(char num='0'; num<='9'; num++) {
+		                        if(GetAsyncKeyState(num) & 0x8000) {
+		                            if(S.empty() && num == '0') continue;
+		                            cout << num;
+		                            S += num;
+		                            Sleep(200);
+		                        }
+		                    }
+		                    if((GetAsyncKeyState(VK_BACK) & 0x8000) && !S.empty()) {
+		                        system("cls");
+		                        S.erase(S.size()-1);
+		                        for(int j=0; j<CD.size(); j++) cout << j+1 << "." << CD[j].name << "\n";
+		                        cout << "请选择存档：" << S;
+		                        Sleep(200);
+		                    }
+		                }
+		                int o = atoi(S.c_str()) - 1;
+		                if(o < 0 || o >= CD.size()) {
+		                    cout << "\n存档不存在！";
+		                    Sleep(500);
+		                    break;
+		                }
+		                x = CD[o].g;
+		                w = 0;
+		                CD_o = 1;
+		                CD_x = CD[o].x;
+		                CD_y = CD[o].y;
+		                CD_a = CD[o].a;
+		                for(int i=1; i<=7; i++) for(int j=1; j<=7; j++) a1[i][j] = CD[o].a1[i][j];
+		                for(int i=1; i<=18; i++) for(int j=1; j<=12; j++) a2[i][j] = CD[o].a2[i][j];
+		                for(int i=1; i<=5; i++) for(int j=1; j<=7; j++) a3[i][j] = CD[o].a3[i][j];
+		                for(int i=1; i<=30; i++) for(int j=1; j<=30; j++) a4[i][j] = CD[o].a4[i][j];
+		                for(int i=1; i<=13; i++) for(int j=1; j<=12; j++) a5[i][j] = CD[o].a5[i][j];
+		                wd = CD[o].wd;
+		                for(int i=1; i<=3; i++) a2npc[i] = CD[o].a2npc[i];
+		                for(int i=1; i<=10; i++) a4npc[i] = CD[o].a4npc[i];
+		                for(int i=1; i<=2; i++) a5npc[i] = CD[o].a5npc[i];
+		                li = CD[o].li;
+		                bli = CD[o].bli;
+		                start_end = CD[o].start_end;
+		                menu_flag = false;
+		                break;
+		            }
+		            if(GetAsyncKeyState('N') & 0x8000) {
+		                break;
+		            }
+		        }
+		    }
+			
+			if(GetAsyncKeyState('1') & 0x8000){
+				menu_flag = false;
+				x=1;
+				Sleep(200);
+			}
+			if(GetAsyncKeyState('2') & 0x8000){
+				return 0;
+			}
+		}
+		
+		while(1)
+		{
+			y=w;
+			w=x;
+			if(x==1)x=f1(y);
+			else if(x==2)x=f2(y);
+			else if(x==3)x=f3(y);
+			else if(x==4)x=f4(y);
+			else if(x==5)x=f5(y);
+			else if(x==0)
+			{
+				cout<<"游戏失败\n"; 
+				break;
+			}
+			else if(x==6)
+			{
+				cout<<"游戏胜利！\n";
+				break;
+			}
+		}
+		
+		cout<<"\n是否生成你的游戏过程(请按Y/N)";
+		while(1)
+		{
+			Sleep(100);
+			if(GetAsyncKeyState('Y')&(0x8000))
+			{
+				freopen("你的游戏过程.cpp","w",stdout);
+				cout<<"#include<bits/stdc++.h>\n#include<windows.h>\nusing namespace std;\nint main(){\n";
+				for(int i=0;i<start_end.size();i++)cout<<start_end[i];
+				cout<<"	Sleep(5000);return 0;\n}";
+				fflush(stdout);
+				freopen("CON","w",stdout);
+				start_end.clear();
+				break;
+			}
+			if(GetAsyncKeyState('N')&(0x8000))
+			{
+				start_end.clear();
+				break;
+			}
+		}
+		show();
+		system("pause");
+	}
+	return 0;
+}
+
+void ready() {
+	int i,j;
+	li=bli=1;
+	wd=" ";
+	string a="墙",b="床", c="柜",d="门",e="消",f="电",o="O "; 
+	//地图1
+	for(i=1;i<=7;i++)for(j=1;j<=7;j++)a1[i][j]="  ";
+	for(i=1;i<=7;i++)a1[1][i]=a,a1[7][i]=a;
+	for(i=2;i<=5;i++)
+	{
+		a1[i][1]=a1[i][7]=a;
+		a1[i][2]=a1[i][6]=b;
+	}
+	a1[6][1]=a1[6][7]=a;
+	a1[6][2]=a1[6][6]=c;
+	a1[7][4]=d;
+	//地图2
+	for(i=1;i<=18;i++)for(j=1;j<=12;j++)a2[i][j]="  ";
+	for(i=3;i<=9;i++)a2[1][i]=a2[18][i]=a;
+	a2[1][8]=c;
+	for(i=2;i<=9;i++)
+	{
+		a2[i][3]=a2[i][9]=a;
+		if(i==6)i+=2;
+	}
+	a2[6][2]=a2[6][1]=a;
+	for(i=7;i<=8;i++)a2[i][1]=a2[i][9]=a;
+	a2[7][1]=c;
+	a2[8][8]=e;
+	a2[9][2]=a2[9][1]=a2[9][10]=a2[9][11]=a2[9][12]=a;
+	for(i=10;i<=13;i++)
+	{
+		a2[i][3]=a2[i][12]=a;
+		if(i>=12)a2[i][9]=a;
+	}
+	for(i=12;i<=13;i++)a2[i][10]=a2[i][11]=a;
+	a2[12][11]=o;
+	a2[13][11]=f;
+	for(i=14;i<=17;i++)a2[i][3]=a2[i][9]=a;
+	a2[16][9]=o;
+	a2[15][10]=a2[17][10]=a;
+	a2[16][10]=d;
+	a2[9][4]=a2[15][8]=a;
+	a2[7][3]=a;
+	//地图2NPC
+	a2npc[1].x=7;a2npc[1].y=2;a2npc[1].s="宿"; 
+	a2npc[2].x=9;a2npc[2].y=8;a2npc[2].s="宿";
+	a2npc[3].x=2;a2npc[3].y=8;a2npc[3].s="宿";
+	for(i=1;i<=3;i++)a2[a2npc[i].x][a2npc[i].y]=a2npc[i].s;
+	//地图3
+	for(i=1;i<=5;i++)for(j=1;j<=7;j++)a3[i][j]="  ";
+	for(i=1;i<=6;i++)a3[1][i]=a3[5][i]=a;
+	for(i=2;i<=4;i+=2)a3[i][1]=a3[i][6]=a3[i][7]=a;
+	a3[3][1]=d;
+	a3[3][7]=f;
+	a3[3][6]=o;
+	//地图4
+	for(i=1;i<=30;i++)for(j=1;j<=30;j++)a4[i][j]="  ";
+	for(i=1;i<=30;i++)a4[1][i]=a4[30][i]=a;
+	for(i=2;i<=29;i++)a4[i][1]=a4[i][30]=a;
+	a4[1][14]=a4[14][30]="大"; 
+	a4[1][15]=a4[15][30]=d;
+	for(i=5;i<=10;i++)a4[4][i]=a4[12][i]=a;
+	for(i=5;i<=11;i++)a4[i][5]=a4[i][10]=a;
+	a4[12][8]="  ";
+	for(i=19;i<=23;i++)a4[4][i]=a4[11][i]=a;
+	for(i=5;i<=10;i++)a4[i][19]=a4[i][23]=a;
+	a4[10][19]=d;
+	a4[12][8]=o;
+	a4[7][7]="教";a4[8][7]="学";a4[9][7]=a4[25][2]="楼";
+	a4[7][21]="食";a4[8][21]="堂"; 
+	a4[6][13]=a4[6][16]=a;
+	a4[11][13]=a4[11][16]=a;
+	for(i=24;i<=26;i++)a4[5][i]=a4[11][i]=a;
+	for(i=6;i<=10;i++)a4[i][26]=a;
+	a4[6][24]="女";a4[19][24]="男";
+	a4[7][24]=a4[20][24]="生";
+	a4[8][24]=a4[21][24]="宿";
+	a4[9][24]=a4[22][24]="舍";
+	for(i=2;i<=6;i++)a4[17][i]=a4[24][i]=a;
+	for(i=18;i<=28;i++)a4[i][6]=a;
+	a4[19][3]="图";a4[20][3]="书";a4[21][3]="馆";
+	a4[17][5]=d;
+	for(i=10;i<=16;i++)a4[16][i]=a4[23][i]=a;
+	for(i=17;i<=22;i++)a4[i][10]=a4[i][16]=a;
+	a4[18][13]="明";a4[19][13]="礼";a4[20][13]="堂";
+	a4[16][15]=a4[23][15]=d;
+	for(i=25;i<=26;i++)a4[i][3]=a;
+	for(i=2;i<=4;i++)a4[28][i]=a;
+	for(i=20;i<=26;i++)a4[18][i]=a4[28][i]=a;
+	for(i=19;i<=27;i++)a4[i][20]=a4[i][26]=a;
+	for(i=19;i<=23;i++)a4[i][23]=a;
+	for(i=23;i<=25;i++)a4[24][i]=a;
+	a4[23][22]="游";a4[24][22]="泳";a4[25][22]="馆";
+	a4[9][26]=a4[22][26]=o;
+	a4[24][14]=a;
+	for(i=10;i<=16;i++)a4[25][i]=a4[28][i]=a;
+	for(i=26;i<=27;i++)a4[i][10]=a4[i][16]=a;
+	a4[19][20]=a4[26][26]=d;
+	a4[26][2]=o;
+	a4[26][11]="体";a4[26][12]="育";a4[26][13]="办";a4[26][14]="公";a4[26][15]="室";
+	a4[25][13]=d;
+	a4[1][13]=a4[13][30]="亭";
+	//地图4NPC
+	a4npc[1].x=1;a4npc[1].y=13;a4npc[1].s="保"; 
+	a4npc[2].x=13;a4npc[2].y=30;a4npc[2].s="保";
+	a4npc[3].x=5;a4npc[3].y=12;a4npc[3].s="师";
+	a4npc[4].x=8;a4npc[4].y=17;a4npc[4].s="师";
+	a4npc[5].x=10;a4npc[5].y=28;a4npc[5].s="师";
+	a4npc[6].x=14;a4npc[6].y=19;a4npc[6].s="师";
+	a4npc[7].x=23;a4npc[7].y=8;a4npc[7].s="师";
+	a4npc[8].x=28;a4npc[8].y=19;a4npc[8].s="师";
+	a4npc[9].x=12;a4npc[9].y=3;a4npc[9].s="师";
+	a4npc[10].x=2;a4npc[10].y=14;a4npc[10].s="校";
+	for(i=3;i<=9;i++)a4[a4npc[i].x][a4npc[i].y]=a4npc[i].s;
+	//地图5	
+	for(i=1;i<=13;i++)for(j=1;j<=12;j++)a5[i][j]="  ";
+	for(i=1;i<=12;i++)a5[1][i]=a5[13][i]=a;
+	for(i=2;i<=12;i++)a5[i][1]=a5[i][12]=a;
+	a5[1][11]="  ";
+	for(i=4;i<=10;i+=2)a5[2][i]=a5[3][i]=a;
+	for(i=3;i<=9;i+=2)for(j=5;j<=9;j++)a5[j][i]=a;
+	for(i=3;i<=10;i++)a5[7][i]=a;
+	for(i=4;i<=10;i+=2)a5[11][i]=a5[12][i]=a;
+	a5[13][2]=a5[13][11]=c;
+	a5[11][2]=a;
+	//地图5NPC 
+	a5npc[1].x=4;a5npc[1].y=2;a5npc[1].s="师";
+	a5npc[2].x=12;a5npc[2].y=2;a5npc[2].s="师";
+	for(i=1;i<=2;i++)a5[a5npc[i].x][a5npc[i].y]=a5npc[i].s;
+	
+}

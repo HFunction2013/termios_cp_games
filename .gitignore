@@ -1,0 +1,19 @@
+/target
+**/target
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.mdimport
+.Trashes
+.vscode/*
+.idea/
+*.iml
+.env
+.env.local
+*.log
+*.exe
+*.dmg
+你的游戏过程.cpp
+# my vscode generates binaries here
+/output

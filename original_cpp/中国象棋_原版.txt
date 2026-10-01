@@ -1,0 +1,2658 @@
+// 中国象棋 - 增强AI版（避免送棋）修复版（学校） 
+#include <iostream>
+#include <vector>
+#include <string>
+#include <algorithm>
+#include <random>
+#include <chrono>
+#include <cmath>
+#include <limits>
+#include <map>
+#include <fstream>
+#include <sstream>
+#include <queue>
+#include <unordered_set>
+#include <functional>
+#include <cstdint> 
+#include <thread>
+// GNU C++11兼容的颜色输出
+#ifdef _WIN32
+#include <windows.h>
+
+namespace Color {
+    static HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
+    
+    enum Code {
+        RED = FOREGROUND_RED | FOREGROUND_INTENSITY,
+        BLACK = 8,
+        WHITE = FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE,
+        GREEN = FOREGROUND_GREEN | FOREGROUND_INTENSITY,
+        YELLOW = FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_INTENSITY,
+        BLUE = FOREGROUND_BLUE | FOREGROUND_INTENSITY,
+        MAGENTA = FOREGROUND_RED | FOREGROUND_BLUE | FOREGROUND_INTENSITY,
+        CYAN = FOREGROUND_GREEN | FOREGROUND_BLUE | FOREGROUND_INTENSITY,
+        DEFAULT = FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE
+    };
+    
+    static void setColor(Code color) {
+        SetConsoleTextAttribute(hConsole, color);
+    }
+    
+    static void reset() {
+        setColor(DEFAULT);
+    }
+}
+
+#else
+// Linux/Unix颜色定义
+namespace Color {
+    enum Code {
+        RED = 31,
+        BLACK = 30,
+        WHITE = 37,
+        GREEN = 32,
+        YELLOW = 33,
+        BLUE = 34,
+        MAGENTA = 35,
+        CYAN = 36,
+        DEFAULT = 0
+    };
+    
+    static void setColor(Code color) {
+        std::cout << "\033[" << color << "m";
+    }
+    
+    static void reset() {
+        std::cout << "\033[0m";
+    }
+}
+#endif
+
+// 棋子类型枚举
+enum PieceType {
+    EMPTY = 0,
+    GENERAL,  // 将/帅
+    ADVISOR,  // 士/仕
+    ELEPHANT, // 象/相
+    HORSE,    // 马/馬
+    CHARIOT,  // 车/車
+    CANNON,   // 炮/砲
+    SOLDIER   // 兵/卒
+};
+
+// 棋子颜色枚举
+enum PieceColor {
+    NONE = 0,
+    RED,
+    BLACK
+};
+
+// 游戏状态枚举
+enum GameState {
+    PLAYING,
+    RED_WIN,
+    BLACK_WIN,
+    DRAW
+};
+
+// AI难度枚举
+enum AIDifficulty {
+    LEVEL_1 = 1,    // 初级：简单启发式
+    LEVEL_2 = 2,    // 中级：Minimax搜索深度2
+    LEVEL_3 = 3,    // 高级：Minimax搜索深度3
+    LEVEL_4 = 4     // 专家：时间限制搜索深度4+
+};
+
+// 游戏阶段枚举
+enum GamePhase {
+    OPENING,    // 开局
+    MIDGAME,    // 中局
+    ENDGAME     // 残局
+};
+
+// 移动方向结构
+struct Move {
+    int fromRow, fromCol;
+    int toRow, toCol;
+    int score;      // AI评估分数
+    int safety;     // 安全性分数（负值表示危险）
+    
+    Move() : fromRow(0), fromCol(0), toRow(0), toCol(0), score(0), safety(0) {}
+    Move(int fr, int fc, int tr, int tc) : fromRow(fr), fromCol(fc), toRow(tr), toCol(tc), score(0), safety(0) {}
+    Move(int fr, int fc, int tr, int tc, int s, int sf) : fromRow(fr), fromCol(fc), toRow(tr), toCol(tc), score(s), safety(sf) {}
+    
+    bool operator==(const Move& other) const {
+        return fromRow == other.fromRow && fromCol == other.fromCol &&
+               toRow == other.toRow && toCol == other.toCol;
+    }
+    
+    bool operator<(const Move& other) const {
+        // 优先考虑安全性，再考虑得分
+        if (safety != other.safety) {
+            return safety < other.safety;  // 安全性高的在前
+        }
+        return score < other.score;
+    }
+};
+
+// 棋子类
+class Piece {
+public:
+    PieceType type;
+    PieceColor color;
+    bool isAlive;
+    
+    Piece() : type(EMPTY), color(NONE), isAlive(false) {}
+    Piece(PieceType t, PieceColor c) : type(t), color(c), isAlive(true) {}
+    
+    // 获取棋子名称（带颜色）
+    std::string getName() const {
+        if (type == EMPTY || color == NONE) return "  ";
+        
+        std::string name;
+        if (color == RED) {
+            Color::setColor(Color::RED);
+            switch(type) {
+                case GENERAL: name = "帅"; break;
+                case ADVISOR: name = "仕"; break;
+                case ELEPHANT: name = "相"; break;
+                case HORSE: name = "马"; break;
+                case CHARIOT: name = "车"; break;
+                case CANNON: name = "炮"; break;
+                case SOLDIER: name = "兵"; break;
+                default: name = "  ";
+            }
+        } else {
+            Color::setColor(Color::BLACK);
+            switch(type) {
+                case GENERAL: name = "将"; break;
+                case ADVISOR: name = "士"; break;
+                case ELEPHANT: name = "象"; break;
+                case HORSE: name = "馬"; break;
+                case CHARIOT: name = "車"; break;
+                case CANNON: name = "砲"; break;
+                case SOLDIER: name = "卒"; break;
+                default: name = "  ";
+            }
+        }
+        return name;
+    }
+    
+    // 获取棋子字母表示
+    char getLetter() const {
+        if (color == RED) {
+            switch(type) {
+                case GENERAL: return 'K';
+                case ADVISOR: return 'A';
+                case ELEPHANT: return 'E';
+                case HORSE: return 'H';
+                case CHARIOT: return 'R';
+                case CANNON: return 'C';
+                case SOLDIER: return 'P';
+                default: return '.';
+            }
+        } else {
+            switch(type) {
+                case GENERAL: return 'k';
+                case ADVISOR: return 'a';
+                case ELEPHANT: return 'e';
+                case HORSE: return 'h';
+                case CHARIOT: return 'r';
+                case CANNON: return 'c';
+                case SOLDIER: return 'p';
+                default: return '.';
+            }
+        }
+    }
+    
+    // 获取棋子价值
+    int getValue() const {
+        // 修改过的价值表，更平衡
+        static const int pieceValues[] = {0, 10000, 25, 25, 45, 100, 50, 15};
+        return pieceValues[type];
+    }
+    
+    // 获取棋子移动灵活性价值
+    int getMobilityValue() const {
+        switch(type) {
+            case GENERAL: return 1;
+            case ADVISOR: return 2;
+            case ELEPHANT: return 2;
+            case HORSE: return 8;
+            case CHARIOT: return 15;
+            case CANNON: return 8;
+            case SOLDIER: return 3;
+            default: return 0;
+        }
+    }
+};
+
+// 棋盘类
+class Board {
+private:
+    Piece board[10][9];  // 10行9列的中国象棋棋盘
+    
+    // Zobrist哈希相关
+    uint64_t zobristHash;
+    std::unordered_set<uint64_t> positionHistory;
+    int fiftyMoveRuleCounter;
+    int repetitionCount;
+    
+    // Zobrist哈希表（静态成员）
+    static const int BOARD_SIZE = 90;  // 10×9
+    static const int NUM_PIECE_TYPES = 14;  // 7种棋子 × 2种颜色
+    static uint64_t zobristTable[BOARD_SIZE][NUM_PIECE_TYPES];
+    static uint64_t zobristSide;
+    static bool zobristInitialized;
+    
+public:
+    Board() {
+        initializeBoard();
+    }
+    
+    // 初始化棋盘
+    void initializeBoard() {
+        // 清空棋盘
+        for (int i = 0; i < 10; i++) {
+            for (int j = 0; j < 9; j++) {
+                board[i][j] = Piece();
+            }
+        }
+        
+        // 设置黑方棋子 (上方)
+        board[0][0] = Piece(CHARIOT, BLACK);
+        board[0][1] = Piece(HORSE, BLACK);
+        board[0][2] = Piece(ELEPHANT, BLACK);
+        board[0][3] = Piece(ADVISOR, BLACK);
+        board[0][4] = Piece(GENERAL, BLACK);
+        board[0][5] = Piece(ADVISOR, BLACK);
+        board[0][6] = Piece(ELEPHANT, BLACK);
+        board[0][7] = Piece(HORSE, BLACK);
+        board[0][8] = Piece(CHARIOT, BLACK);
+        
+        board[2][1] = Piece(CANNON, BLACK);
+        board[2][7] = Piece(CANNON, BLACK);
+        
+        board[3][0] = Piece(SOLDIER, BLACK);
+        board[3][2] = Piece(SOLDIER, BLACK);
+        board[3][4] = Piece(SOLDIER, BLACK);
+        board[3][6] = Piece(SOLDIER, BLACK);
+        board[3][8] = Piece(SOLDIER, BLACK);
+        
+        // 设置红方棋子 (下方)
+        board[9][0] = Piece(CHARIOT, RED);
+        board[9][1] = Piece(HORSE, RED);
+        board[9][2] = Piece(ELEPHANT, RED);
+        board[9][3] = Piece(ADVISOR, RED);
+        board[9][4] = Piece(GENERAL, RED);
+        board[9][5] = Piece(ADVISOR, RED);
+        board[9][6] = Piece(ELEPHANT, RED);
+        board[9][7] = Piece(HORSE, RED);
+        board[9][8] = Piece(CHARIOT, RED);
+        
+        board[7][1] = Piece(CANNON, RED);
+        board[7][7] = Piece(CANNON, RED);
+        
+        board[6][0] = Piece(SOLDIER, RED);
+        board[6][2] = Piece(SOLDIER, RED);
+        board[6][4] = Piece(SOLDIER, RED);
+        board[6][6] = Piece(SOLDIER, RED);
+        board[6][8] = Piece(SOLDIER, RED);
+        
+        // 初始化Zobrist哈希
+        initializeZobrist();
+        zobristHash = computeZobristHash();
+        
+        // 重置历史记录
+        resetPositionHistory();
+        recordPosition();
+    }
+    
+    // Zobrist哈希初始化
+    static void initializeZobrist() {
+        if (!zobristInitialized) {
+            std::mt19937_64 rng(123456789);
+            
+            for (int i = 0; i < BOARD_SIZE; i++) {
+                for (int j = 0; j < NUM_PIECE_TYPES; j++) {
+                    zobristTable[i][j] = rng();
+                }
+            }
+            
+            zobristSide = rng();
+            zobristInitialized = true;
+        }
+    }
+    
+    // 计算Zobrist哈希
+    uint64_t computeZobristHash() const {
+        uint64_t hash = 0;
+        
+        for (int row = 0; row < 10; row++) {
+            for (int col = 0; col < 9; col++) {
+                Piece piece = getPiece(row, col);
+                if (piece.type != EMPTY && piece.color != NONE) {
+                    int pieceIndex = getPieceIndex(piece);
+                    int boardIndex = row * 9 + col;
+                    hash ^= zobristTable[boardIndex][pieceIndex];
+                }
+            }
+        }
+        
+        return hash;
+    }
+    
+    // 获取棋子索引
+    int getPieceIndex(const Piece& piece) const {
+        int colorOffset = (piece.color == RED) ? 0 : 7;
+        int typeIndex = 0;
+        
+        switch(piece.type) {
+            case GENERAL: typeIndex = 0; break;
+            case ADVISOR: typeIndex = 1; break;
+            case ELEPHANT: typeIndex = 2; break;
+            case HORSE: typeIndex = 3; break;
+            case CHARIOT: typeIndex = 4; break;
+            case CANNON: typeIndex = 5; break;
+            case SOLDIER: typeIndex = 6; break;
+            default: typeIndex = 0;
+        }
+        
+        return colorOffset + typeIndex;
+    }
+    
+    // 更新Zobrist哈希
+    void updateZobristHash(int fromRow, int fromCol, int toRow, int toCol, const Piece& capturedPiece) {
+        // 移除起始位置的棋子
+        Piece fromPiece = getPiece(fromRow, fromCol);
+        int fromBoardIndex = fromRow * 9 + fromCol;
+        int fromPieceIndex = getPieceIndex(fromPiece);
+        zobristHash ^= zobristTable[fromBoardIndex][fromPieceIndex];
+        
+        // 移除目标位置的棋子（如果被吃掉）
+        if (capturedPiece.type != EMPTY) {
+            int capturedBoardIndex = toRow * 9 + toCol;
+            int capturedPieceIndex = getPieceIndex(capturedPiece);
+            zobristHash ^= zobristTable[capturedBoardIndex][capturedPieceIndex];
+        }
+        
+        // 添加移动后的棋子到目标位置
+        int toBoardIndex = toRow * 9 + toCol;
+        int toPieceIndex = getPieceIndex(fromPiece);  // 棋子本身没有变化
+        zobristHash ^= zobristTable[toBoardIndex][toPieceIndex];
+        
+        // 切换走棋方
+        zobristHash ^= zobristSide;
+    }
+    
+    // 记录当前局面
+    void recordPosition() {
+        positionHistory.insert(zobristHash);
+        
+        // 计算重复次数
+        repetitionCount = 0;
+        for (std::unordered_set<uint64_t>::const_iterator it = positionHistory.begin(); 
+             it != positionHistory.end(); ++it) {
+            if (*it == zobristHash) {
+                repetitionCount++;
+            }
+        }
+    }
+    
+    // 检查是否三次重复局面
+    bool isThreefoldRepetition() const {
+        return repetitionCount >= 3;
+    }
+    
+    // 检查是否50回合规则和棋
+    bool isFiftyMoveRuleDraw() const {
+        return fiftyMoveRuleCounter >= 100;  // 100步 = 50回合
+    }
+    
+    // 重置局面历史
+    void resetPositionHistory() {
+        positionHistory.clear();
+        fiftyMoveRuleCounter = 0;
+        repetitionCount = 0;
+    }
+    
+    // 获取当前局面哈希值
+    uint64_t getZobristHash() const { return zobristHash; }
+    
+    // 获取局面重复次数
+    int getRepetitionCount() const { return repetitionCount; }
+    
+    // 获取50步规则计数器
+    int getFiftyMoveCounter() const { return fiftyMoveRuleCounter; }
+    
+    // 获取棋盘上的棋子
+    Piece getPiece(int row, int col) const {
+        if (row >= 0 && row < 10 && col >= 0 && col < 9) {
+            return board[row][col];
+        }
+        return Piece();
+    }
+    
+    // 设置棋盘上的棋子
+    void setPiece(int row, int col, const Piece& piece) {
+        if (row >= 0 && row < 10 && col >= 0 && col < 9) {
+            board[row][col] = piece;
+        }
+    }
+    
+    // 移动棋子（修复：检查是否移动自己的棋子）
+    bool movePiece(const Move& move, PieceColor currentPlayer) {
+        int fromRow = move.fromRow;
+        int fromCol = move.fromCol;
+        int toRow = move.toRow;
+        int toCol = move.toCol;
+        
+        // 检查位置是否有效
+        if (!isValidPosition(fromRow, fromCol) || !isValidPosition(toRow, toCol)) {
+            return false;
+        }
+        
+        Piece fromPiece = getPiece(fromRow, fromCol);
+        Piece toPiece = getPiece(toRow, toCol);
+        
+        // 检查是否有棋子可以移动
+        if (fromPiece.type == EMPTY || fromPiece.color == NONE) {
+            return false;
+        }
+        
+        // 修复：检查是否移动自己的棋子
+        if (fromPiece.color != currentPlayer) {
+            return false;
+        }
+        
+        // 检查目标位置是否有己方棋子
+        if (toPiece.color == fromPiece.color) {
+            return false;
+        }
+        
+        // 检查移动是否合法
+        if (!isMoveLegal(fromRow, fromCol, toRow, toCol)) {
+            return false;
+        }
+        
+        // 记录吃子信息
+        bool isCapture = (toPiece.type != EMPTY);
+        bool isSoldierMove = (fromPiece.type == SOLDIER);
+        
+        // 更新50步规则计数器
+        if (isCapture || isSoldierMove) {
+            fiftyMoveRuleCounter = 0;  // 重置计数器
+        } else {
+            fiftyMoveRuleCounter++;    // 增加计数器
+        }
+        
+        // 更新Zobrist哈希
+        updateZobristHash(fromRow, fromCol, toRow, toCol, toPiece);
+        
+        // 执行移动
+        setPiece(toRow, toCol, fromPiece);
+        setPiece(fromRow, fromCol, Piece());
+        
+        // 记录当前局面
+        recordPosition();
+        
+        return true;
+    }
+    
+    // 检查位置是否有效
+    bool isValidPosition(int row, int col) const {
+        return row >= 0 && row < 10 && col >= 0 && col < 9;
+    }
+    
+    // 检查移动是否合法
+    bool isMoveLegal(int fromRow, int fromCol, int toRow, int toCol) const {
+        Piece fromPiece = getPiece(fromRow, fromCol);
+        Piece toPiece = getPiece(toRow, toCol);
+        
+        if (fromPiece.type == EMPTY || fromPiece.color == NONE) {
+            return false;
+        }
+        
+        if (fromPiece.color == toPiece.color) {
+            return false;
+        }
+        
+        int rowDiff = toRow - fromRow;
+        int colDiff = toCol - fromCol;
+        
+        // 根据棋子类型检查移动规则
+        switch(fromPiece.type) {
+            case GENERAL:   // 将/帅
+                return isGeneralMoveLegal(fromRow, fromCol, toRow, toCol, fromPiece.color);
+            case ADVISOR:   // 士/仕
+                return isAdvisorMoveLegal(fromRow, fromCol, toRow, toCol, fromPiece.color);
+            case ELEPHANT:  // 象/相
+                return isElephantMoveLegal(fromRow, fromCol, toRow, toCol, fromPiece.color);
+            case HORSE:     // 马/馬
+                return isHorseMoveLegal(fromRow, fromCol, toRow, toCol);
+            case CHARIOT:   // 车/車
+                return isChariotMoveLegal(fromRow, fromCol, toRow, toCol);
+            case CANNON:    // 炮/砲
+                return isCannonMoveLegal(fromRow, fromCol, toRow, toCol);
+            case SOLDIER:   // 兵/卒
+                return isSoldierMoveLegal(fromRow, fromCol, toRow, toCol, fromPiece.color);
+            default:
+                return false;
+        }
+    }
+    
+    // 将/帅移动规则（包含"飞将"规则）
+    bool isGeneralMoveLegal(int fromRow, int fromCol, int toRow, int toCol, PieceColor color) const {
+        Piece toPiece = getPiece(toRow, toCol);
+        
+        // 检查是否是"飞将"（将帅照面）
+        if (toPiece.type == GENERAL && toPiece.color != color) {
+            // 将和帅必须在同一列
+            if (fromCol != toCol) {
+                return false;
+            }
+            
+            // 检查将和帅之间是否有其他棋子
+            int startRow = std::min(fromRow, toRow) + 1;
+            int endRow = std::max(fromRow, toRow);
+            
+            for (int r = startRow; r < endRow; r++) {
+                if (getPiece(r, fromCol).type != EMPTY) {
+                    return false;
+                }
+            }
+            
+            return true;
+        }
+        
+        // 将/帅只能在九宫格内移动
+        if (color == RED) {
+            if (toRow < 7 || toRow > 9 || toCol < 3 || toCol > 5) {
+                return false;
+            }
+        } else {
+            if (toRow < 0 || toRow > 2 || toCol < 3 || toCol > 5) {
+                return false;
+            }
+        }
+        
+        // 只能移动一步（上下左右）
+        int rowDiff = abs(toRow - fromRow);
+        int colDiff = abs(toCol - fromCol);
+        
+        return (rowDiff == 1 && colDiff == 0) || (rowDiff == 0 && colDiff == 1);
+    }
+    
+    // 士/仕移动规则
+    bool isAdvisorMoveLegal(int fromRow, int fromCol, int toRow, int toCol, PieceColor color) const {
+        // 士/仕只能在九宫格内移动
+        if (color == RED) {
+            if (toRow < 7 || toRow > 9 || toCol < 3 || toCol > 5) {
+                return false;
+            }
+        } else {
+            if (toRow < 0 || toRow > 2 || toCol < 3 || toCol > 5) {
+                return false;
+            }
+        }
+        
+        // 只能斜着移动一步
+        int rowDiff = abs(toRow - fromRow);
+        int colDiff = abs(toCol - fromCol);
+        
+        return rowDiff == 1 && colDiff == 1;
+    }
+    
+    // 象/相移动规则
+    bool isElephantMoveLegal(int fromRow, int fromCol, int toRow, int toCol, PieceColor color) const {
+        // 不能过河
+        if (color == RED && toRow < 5) return false;
+        if (color == BLACK && toRow > 4) return false;
+        
+        // 只能走田字
+        int rowDiff = abs(toRow - fromRow);
+        int colDiff = abs(toCol - fromCol);
+        
+        if (rowDiff != 2 || colDiff != 2) {
+            return false;
+        }
+        
+        // 检查是否塞象眼
+        int middleRow = (fromRow + toRow) / 2;
+        int middleCol = (fromCol + toCol) / 2;
+        
+        return getPiece(middleRow, middleCol).type == EMPTY;
+    }
+    
+    // 马/馬移动规则
+    bool isHorseMoveLegal(int fromRow, int fromCol, int toRow, int toCol) const {
+        int rowDiff = abs(toRow - fromRow);
+        int colDiff = abs(toCol - fromCol);
+        
+        // 马走日：一个方向走2格，另一个方向走1格
+        if (!((rowDiff == 2 && colDiff == 1) || (rowDiff == 1 && colDiff == 2))) {
+            return false;
+        }
+        
+        // 检查是否蹩马腿
+        if (rowDiff == 2) {
+            int middleRow = (fromRow + toRow) / 2;
+            if (getPiece(middleRow, fromCol).type != EMPTY) {
+                return false;
+            }
+        } else {
+            int middleCol = (fromCol + toCol) / 2;
+            if (getPiece(fromRow, middleCol).type != EMPTY) {
+                return false;
+            }
+        }
+        
+        return true;
+    }
+    
+    // 车/車移动规则
+    bool isChariotMoveLegal(int fromRow, int fromCol, int toRow, int toCol) const {
+        if (fromRow != toRow && fromCol != toCol) {
+            return false;
+        }
+        
+        if (fromRow == toRow) {
+            int startCol = std::min(fromCol, toCol) + 1;
+            int endCol = std::max(fromCol, toCol);
+            
+            for (int c = startCol; c < endCol; c++) {
+                if (getPiece(fromRow, c).type != EMPTY) {
+                    return false;
+                }
+            }
+        } else {
+            int startRow = std::min(fromRow, toRow) + 1;
+            int endRow = std::max(fromRow, toRow);
+            
+            for (int r = startRow; r < endRow; r++) {
+                if (getPiece(r, fromCol).type != EMPTY) {
+                    return false;
+                }
+            }
+        }
+        
+        return true;
+    }
+    
+    // 炮/砲移动规则
+    bool isCannonMoveLegal(int fromRow, int fromCol, int toRow, int toCol) const {
+        if (fromRow != toRow && fromCol != toCol) {
+            return false;
+        }
+        
+        Piece toPiece = getPiece(toRow, toCol);
+        int piecesBetween = 0;
+        
+        if (fromRow == toRow) {
+            int startCol = std::min(fromCol, toCol) + 1;
+            int endCol = std::max(fromCol, toCol);
+            
+            for (int c = startCol; c < endCol; c++) {
+                if (getPiece(fromRow, c).type != EMPTY) {
+                    piecesBetween++;
+                }
+            }
+        } else {
+            int startRow = std::min(fromRow, toRow) + 1;
+            int endRow = std::max(fromRow, toRow);
+            
+            for (int r = startRow; r < endRow; r++) {
+                if (getPiece(r, fromCol).type != EMPTY) {
+                    piecesBetween++;
+                }
+            }
+        }
+        
+        if (toPiece.type == EMPTY) {
+            return piecesBetween == 0;
+        } else {
+            return piecesBetween == 1;
+        }
+    }
+    
+    // 兵/卒移动规则
+    bool isSoldierMoveLegal(int fromRow, int fromCol, int toRow, int toCol, PieceColor color) const {
+        int rowDiff = toRow - fromRow;
+        int colDiff = abs(toCol - fromCol);
+        
+        // 兵/卒不能后退
+        if (color == RED && rowDiff > 0) return false;
+        if (color == BLACK && rowDiff < 0) return false;
+        
+        // 检查是否过河
+        bool isCrossedRiver = (color == RED && fromRow <= 4) || (color == BLACK && fromRow >= 5);
+        
+        if (isCrossedRiver) {
+            // 过河后可以向前或左右移动一步
+            return (abs(rowDiff) == 1 && colDiff == 0) || (abs(rowDiff) == 0 && colDiff == 1);
+        } else {
+            // 过河前只能向前走一步
+            return abs(rowDiff) == 1 && colDiff == 0;
+        }
+    }
+    
+    // 检查是否被将军
+    bool isInCheck(PieceColor color) const {
+        // 找到将/帅的位置
+        int generalRow = -1, generalCol = -1;
+        
+        for (int r = 0; r < 10; r++) {
+            for (int c = 0; c < 9; c++) {
+                Piece piece = getPiece(r, c);
+                if (piece.type == GENERAL && piece.color == color) {
+                    generalRow = r;
+                    generalCol = c;
+                    break;
+                }
+            }
+            if (generalRow != -1) break;
+        }
+        
+        if (generalRow == -1) return false;
+        
+        // 检查是否有对方的棋子可以攻击将/帅
+        PieceColor opponentColor = (color == RED) ? BLACK : RED;
+        
+        for (int r = 0; r < 10; r++) {
+            for (int c = 0; c < 9; c++) {
+                Piece piece = getPiece(r, c);
+                if (piece.color == opponentColor) {
+                    if (isMoveLegal(r, c, generalRow, generalCol)) {
+                        return true;
+                    }
+                }
+            }
+        }
+        
+        // 检查"飞将"情况
+        int opponentGeneralRow = -1, opponentGeneralCol = -1;
+        for (int r = 0; r < 10; r++) {
+            for (int c = 0; c < 9; c++) {
+                Piece piece = getPiece(r, c);
+                if (piece.type == GENERAL && piece.color == opponentColor) {
+                    opponentGeneralRow = r;
+                    opponentGeneralCol = c;
+                    break;
+                }
+            }
+            if (opponentGeneralRow != -1) break;
+        }
+        
+        if (opponentGeneralRow == -1) return false;
+        
+        if (generalCol == opponentGeneralCol) {
+            int startRow = std::min(generalRow, opponentGeneralRow) + 1;
+            int endRow = std::max(generalRow, opponentGeneralRow);
+            
+            for (int r = startRow; r < endRow; r++) {
+                if (getPiece(r, generalCol).type != EMPTY) {
+                    return false;
+                }
+            }
+            
+            return true;
+        }
+        
+        return false;
+    }
+    
+    // 检查游戏是否结束
+    GameState checkGameState(PieceColor currentPlayer) const {
+        // 检查双方是否有将/帅
+        bool redHasGeneral = false;
+        bool blackHasGeneral = false;
+        
+        for (int r = 0; r < 10; r++) {
+            for (int c = 0; c < 9; c++) {
+                Piece piece = getPiece(r, c);
+                if (piece.type == GENERAL) {
+                    if (piece.color == RED) redHasGeneral = true;
+                    if (piece.color == BLACK) blackHasGeneral = true;
+                }
+            }
+        }
+        
+        if (!redHasGeneral) return BLACK_WIN;
+        if (!blackHasGeneral) return RED_WIN;
+        
+        // 检查当前玩家是否被将军
+        if (isInCheck(currentPlayer)) {
+            std::vector<Move> legalMoves = getAllLegalMoves(currentPlayer);
+            if (legalMoves.empty()) {
+                return (currentPlayer == RED) ? BLACK_WIN : RED_WIN;
+            }
+        }
+        
+        // 检查重复局面和棋
+        if (isThreefoldRepetition()) {
+            return DRAW;
+        }
+        
+        // 检查50步规则和棋
+        if (isFiftyMoveRuleDraw()) {
+            return DRAW;
+        }
+        
+        // 检查无足够进攻子力
+        if (isInsufficientMaterial()) {
+            return DRAW;
+        }
+        
+        return PLAYING;
+    }
+    
+    // 检查是否无足够进攻子力
+    bool isInsufficientMaterial() const {
+        int redPieces = 0;
+        int blackPieces = 0;
+        int redAttackPieces = 0;  // 进攻子力（车马炮兵）
+        int blackAttackPieces = 0;
+        
+        for (int r = 0; r < 10; r++) {
+            for (int c = 0; c < 9; c++) {
+                Piece piece = getPiece(r, c);
+                if (piece.type != EMPTY) {
+                    if (piece.color == RED) {
+                        redPieces++;
+                        if (piece.type == CHARIOT || piece.type == HORSE || 
+                            piece.type == CANNON || piece.type == SOLDIER) {
+                            redAttackPieces++;
+                        }
+                    } else {
+                        blackPieces++;
+                        if (piece.type == CHARIOT || piece.type == HORSE || 
+                            piece.type == CANNON || piece.type == SOLDIER) {
+                            blackAttackPieces++;
+                        }
+                    }
+                }
+            }
+        }
+        
+        // 双方都只有将/帅，或一方只有将/帅另一方只有将/帅和士象
+        if (redPieces == 1 && blackPieces == 1) return true;
+        if (redAttackPieces == 0 && blackAttackPieces == 0) return true;
+        
+        return false;
+    }
+    
+    // 获取所有合法移动（修复：传入当前玩家颜色）
+    std::vector<Move> getAllLegalMoves(PieceColor color) const {
+        std::vector<Move> moves;
+        
+        for (int fromRow = 0; fromRow < 10; fromRow++) {
+            for (int fromCol = 0; fromCol < 9; fromCol++) {
+                Piece fromPiece = getPiece(fromRow, fromCol);
+                if (fromPiece.color == color) {
+                    for (int toRow = 0; toRow < 10; toRow++) {
+                        for (int toCol = 0; toCol < 9; toCol++) {
+                            if (isMoveLegal(fromRow, fromCol, toRow, toCol)) {
+                                // 创建一个临时棋盘测试移动
+                                Board testBoard = *this;
+                                Move testMove(fromRow, fromCol, toRow, toCol);
+                                
+                                // 修复：传入当前玩家颜色
+                                if (testBoard.movePiece(testMove, color)) {
+                                    if (!testBoard.isInCheck(color)) {
+                                        moves.push_back(testMove);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        return moves;
+    }
+    
+    // 获取游戏阶段
+    GamePhase getGamePhase() const {
+        int pieceCount = 0;
+        
+        for (int i = 0; i < 10; i++) {
+            for (int j = 0; j < 9; j++) {
+                if (getPiece(i, j).type != EMPTY) {
+                    pieceCount++;
+                }
+            }
+        }
+        
+        if (pieceCount > 20) return OPENING;
+        if (pieceCount > 10) return MIDGAME;
+        return ENDGAME;
+    }
+    
+    // 显示棋盘（带颜色）
+    void display() const {
+        Color::setColor(Color::YELLOW);
+        std::cout << "\n    0   1   2   3   4   5   6   7   8\n";
+        std::cout << "  ┌───┬───┬───┬───┬───┬───┬───┬───┬───┐\n";
+        
+        for (int i = 0; i < 10; i++) {
+            Color::setColor(Color::YELLOW);
+            if (i > 0) {
+                std::cout << "  ├───┼───┼───┼───┼───┼───┼───┼───┼───┤\n";
+            }
+            std::cout << i << " │";
+            
+            for (int j = 0; j < 9; j++) {
+                Piece piece = getPiece(i, j);
+                std::cout << piece.getName();
+                Color::setColor(Color::YELLOW);
+                std::cout << " │";
+                Color::reset();
+            }
+            
+            Color::setColor(Color::YELLOW);
+            std::cout << "\n";
+            
+            if (i == 4) {
+                std::cout << "  ├───┼───┼───┼───┼───┼───┼───┼───┼───┤\n";
+                std::cout << "  │    楚      河      汉      界     │\n";
+            }
+        }
+        
+        std::cout << "  └───┴───┴───┴───┴───┴───┴───┴───┴───┘\n";
+        Color::reset();
+    }
+    
+    // 复制棋盘
+    Board copy() const {
+        Board newBoard;
+        for (int i = 0; i < 10; i++) {
+            for (int j = 0; j < 9; j++) {
+                newBoard.board[i][j] = this->board[i][j];
+            }
+        }
+        newBoard.zobristHash = this->zobristHash;
+        newBoard.positionHistory = this->positionHistory;
+        newBoard.fiftyMoveRuleCounter = this->fiftyMoveRuleCounter;
+        newBoard.repetitionCount = this->repetitionCount;
+        return newBoard;
+    }
+    
+    // 检查一个位置是否被攻击
+    bool isSquareAttacked(int row, int col, PieceColor attackerColor) const {
+        for (int r = 0; r < 10; r++) {
+            for (int c = 0; c < 9; c++) {
+                Piece piece = getPiece(r, c);
+                if (piece.color == attackerColor && piece.type != EMPTY) {
+                    if (isMoveLegal(r, c, row, col)) {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+    
+    // 评估棋盘分数（增强版，避免送棋）
+    int evaluate(PieceColor perspective) const {
+        int score = 0;
+        
+        // 棋子基本价值
+        static const int pieceValues[] = {0, 10000, 25, 25, 45, 100, 50, 15};
+        
+        // 计算棋子价值和位置
+        for (int i = 0; i < 10; i++) {
+            for (int j = 0; j < 9; j++) {
+                Piece piece = getPiece(i, j);
+                if (piece.type != EMPTY && piece.color != NONE) {
+                    int pieceScore = pieceValues[piece.type];
+                    
+                    // 棋子位置加成
+                    int posBonus = getPositionBonus(i, j, piece.type, piece.color);
+                    
+                    int totalValue = pieceScore + posBonus;
+                    
+                    if ((perspective == RED && piece.color == RED) ||
+                        (perspective == BLACK && piece.color == BLACK)) {
+                        score += totalValue;
+                    } else {
+                        score -= totalValue;
+                    }
+                }
+            }
+        }
+        
+        // 棋子安全性评估
+        score += evaluateSafety(perspective);
+        
+        // 棋子灵活性
+        int mobility = getAllLegalMoves(perspective).size();
+        int opponentMobility = getAllLegalMoves(perspective == RED ? BLACK : RED).size();
+        score += (mobility - opponentMobility) * 3;
+        
+        // 将军威胁
+        if (isInCheck(perspective == RED ? BLACK : RED)) {
+            score += 50;
+        }
+        
+        // 控制中心区域
+        int centerControl = 0;
+        for (int i = 3; i <= 6; i++) {
+            for (int j = 3; j <= 5; j++) {
+                if (isSquareAttacked(i, j, perspective)) {
+                    centerControl += 5;
+                }
+                if (isSquareAttacked(i, j, perspective == RED ? BLACK : RED)) {
+                    centerControl -= 5;
+                }
+            }
+        }
+        score += centerControl;
+        
+        // 棋子协调性
+        int coordination = evaluateCoordination(perspective);
+        score += coordination;
+        
+        // 兵/卒结构
+        int pawnStructure = evaluatePawnStructure(perspective);
+        score += pawnStructure;
+        
+        return score;
+    }
+    
+    // 获取位置奖励
+    int getPositionBonus(int row, int col, PieceType type, PieceColor color) const {
+        // 位置奖励表
+        static const int horsePos[10][9] = {
+            {0, 0, 0, 0, 0, 0, 0, 0, 0},
+            {0, 5, 8, 10, 8, 10, 8, 5, 0},
+            {0, 5, 8, 12, 15, 12, 8, 5, 0},
+            {0, 5, 8, 12, 15, 12, 8, 5, 0},
+            {0, 0, 5, 8, 10, 8, 5, 0, 0},
+            {0, 0, 5, 8, 10, 8, 5, 0, 0},
+            {0, 5, 8, 12, 15, 12, 8, 5, 0},
+            {0, 5, 8, 10, 8, 10, 8, 5, 0},
+            {0, 5, 8, 10, 8, 10, 8, 5, 0},
+            {0, 0, 0, 0, 0, 0, 0, 0, 0}
+        };
+        
+        static const int chariotPos[10][9] = {
+            {0, 0, 0, 0, 0, 0, 0, 0, 0},
+            {5, 8, 10, 12, 15, 12, 10, 8, 5},
+            {5, 8, 10, 12, 15, 12, 10, 8, 5},
+            {5, 8, 10, 12, 15, 12, 10, 8, 5},
+            {5, 8, 10, 12, 15, 12, 10, 8, 5},
+            {5, 8, 10, 12, 15, 12, 10, 8, 5},
+            {5, 8, 10, 12, 15, 12, 10, 8, 5},
+            {5, 8, 10, 12, 15, 12, 10, 8, 5},
+            {5, 8, 10, 12, 15, 12, 10, 8, 5},
+            {0, 0, 0, 0, 0, 0, 0, 0, 0}
+        };
+        
+        static const int cannonPos[10][9] = {
+            {0, 0, 0, 5, 5, 5, 0, 0, 0},
+            {0, 5, 8, 10, 15, 10, 8, 5, 0},
+            {0, 5, 8, 10, 15, 10, 8, 5, 0},
+            {0, 5, 8, 10, 15, 10, 8, 5, 0},
+            {0, 0, 5, 8, 10, 8, 5, 0, 0},
+            {0, 0, 5, 8, 10, 8, 5, 0, 0},
+            {0, 5, 8, 10, 15, 10, 8, 5, 0},
+            {0, 5, 8, 10, 15, 10, 8, 5, 0},
+            {0, 5, 8, 10, 15, 10, 8, 5, 0},
+            {0, 0, 0, 5, 5, 5, 0, 0, 0}
+        };
+        
+        static const int soldierPos[10][9] = {
+            {0, 0, 0, 0, 0, 0, 0, 0, 0},
+            {0, 0, 0, 0, 0, 0, 0, 0, 0},
+            {5, 8, 10, 15, 20, 15, 10, 8, 5},
+            {10, 15, 20, 25, 30, 25, 20, 15, 10},
+            {15, 20, 25, 30, 35, 30, 25, 20, 15},
+            {15, 20, 25, 30, 35, 30, 25, 20, 15},
+            {10, 15, 20, 25, 30, 25, 20, 15, 10},
+            {5, 8, 10, 15, 20, 15, 10, 8, 5},
+            {0, 0, 0, 0, 0, 0, 0, 0, 0},
+            {0, 0, 0, 0, 0, 0, 0, 0, 0}
+        };
+        
+        int bonus = 0;
+        
+        // 调整行索引（红方和黑方镜像）
+        int adjustedRow = (color == RED) ? row : (9 - row);
+        
+        switch(type) {
+            case HORSE:
+                bonus = horsePos[adjustedRow][col];
+                break;
+            case CHARIOT:
+                bonus = chariotPos[adjustedRow][col];
+                break;
+            case CANNON:
+                bonus = cannonPos[adjustedRow][col];
+                break;
+            case SOLDIER:
+                bonus = soldierPos[adjustedRow][col];
+                // 过河奖励
+                if ((color == RED && row <= 4) || (color == BLACK && row >= 5)) {
+                    bonus += 10;
+                }
+                // 靠近九宫奖励
+                if ((color == RED && row <= 2) || (color == BLACK && row >= 7)) {
+                    bonus += 15;
+                }
+                break;
+            case GENERAL:
+                // 将/帅在九宫中央更安全
+                if (col == 4) bonus += 5;
+                break;
+            default:
+                break;
+        }
+        
+        return bonus;
+    }
+    
+    // 评估棋子安全性
+    int evaluateSafety(PieceColor perspective) const {
+        int safetyScore = 0;
+        PieceColor opponentColor = (perspective == RED) ? BLACK : RED;
+        
+        for (int i = 0; i < 10; i++) {
+            for (int j = 0; j < 9; j++) {
+                Piece piece = getPiece(i, j);
+                if (piece.type != EMPTY && piece.color == perspective) {
+                    // 检查棋子是否被攻击
+                    bool isAttacked = isSquareAttacked(i, j, opponentColor);
+                    // 检查棋子是否有保护
+                    bool isProtected = isSquareProtected(i, j, perspective);
+                    
+                    if (isAttacked) {
+                        // 被攻击但没有保护，严重扣分
+                        if (!isProtected) {
+                            safetyScore -= piece.getValue() / 2;
+                        }
+                        // 被攻击但有保护，轻微扣分
+                        else {
+                            safetyScore -= piece.getValue() / 10;
+                        }
+                    } else if (isProtected) {
+                        // 有保护且不被攻击，加分
+                        safetyScore += piece.getValue() / 20;
+                    }
+                }
+            }
+        }
+        
+        return safetyScore;
+    }
+    
+    // 检查棋子是否有保护
+    bool isSquareProtected(int row, int col, PieceColor defenderColor) const {
+        for (int r = 0; r < 10; r++) {
+            for (int c = 0; c < 9; c++) {
+                Piece piece = getPiece(r, c);
+                if (piece.color == defenderColor && piece.type != EMPTY) {
+                    // 跳过被检查的棋子本身
+                    if (r == row && c == col) continue;
+                    
+                    if (isMoveLegal(r, c, row, col)) {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+    
+    // 评估棋子协调性
+    int evaluateCoordination(PieceColor perspective) const {
+        int coordination = 0;
+        int chariotCount = 0;
+        int cannonCount = 0;
+        int horseCount = 0;
+        
+        for (int i = 0; i < 10; i++) {
+            for (int j = 0; j < 9; j++) {
+                Piece piece = getPiece(i, j);
+                if (piece.color == perspective) {
+                    switch(piece.type) {
+                        case CHARIOT:
+                            chariotCount++;
+                            // 车在对方半场更有威胁
+                            if ((perspective == RED && i <= 4) || 
+                                (perspective == BLACK && i >= 5)) {
+                                coordination += 15;
+                            }
+                            break;
+                        case CANNON:
+                            cannonCount++;
+                            // 炮在河界附近较好
+                            if (i == 4 || i == 5) {
+                                coordination += 10;
+                            }
+                            break;
+                        case HORSE:
+                            horseCount++;
+                            // 马在中心区域较好
+                            if (i >= 3 && i <= 6 && j >= 3 && j <= 5) {
+                                coordination += 10;
+                            }
+                            break;
+                        default:
+                            break;
+                    }
+                }
+            }
+        }
+        
+        // 双车配合
+        if (chariotCount == 2) coordination += 20;
+        // 双炮配合
+        if (cannonCount == 2) coordination += 10;
+        // 双马配合
+        if (horseCount == 2) coordination += 10;
+        
+        return coordination;
+    }
+    
+    // 评估兵/卒结构
+    int evaluatePawnStructure(PieceColor perspective) const {
+        int pawnScore = 0;
+        PieceColor opponentColor = (perspective == RED) ? BLACK : RED;
+        
+        // 统计兵/卒数量
+        int pawnCount = 0;
+        int connectedPawns = 0;  // 相连的兵
+        
+        for (int i = 0; i < 10; i++) {
+            for (int j = 0; j < 9; j++) {
+                Piece piece = getPiece(i, j);
+                if (piece.type == SOLDIER && piece.color == perspective) {
+                    pawnCount++;
+                    
+                    // 检查是否有相连的兵
+                    if (j > 0) {
+                        Piece leftPiece = getPiece(i, j-1);
+                        if (leftPiece.type == SOLDIER && leftPiece.color == perspective) {
+                            connectedPawns++;
+                        }
+                    }
+                    if (j < 8) {
+                        Piece rightPiece = getPiece(i, j+1);
+                        if (rightPiece.type == SOLDIER && rightPiece.color == perspective) {
+                            connectedPawns++;
+                        }
+                    }
+                    
+                    // 兵过河奖励
+                    if ((perspective == RED && i <= 4) || 
+                        (perspective == BLACK && i >= 5)) {
+                        pawnScore += 15;
+                    }
+                    
+                    // 兵靠近对方将/帅奖励
+                    if ((perspective == RED && i <= 2) || 
+                        (perspective == BLACK && i >= 7)) {
+                        pawnScore += 20;
+                    }
+                }
+            }
+        }
+        
+        // 兵的数量优势
+        int opponentPawnCount = 0;
+        for (int i = 0; i < 10; i++) {
+            for (int j = 0; j < 9; j++) {
+                Piece piece = getPiece(i, j);
+                if (piece.type == SOLDIER && piece.color == opponentColor) {
+                    opponentPawnCount++;
+                }
+            }
+        }
+        
+        pawnScore += (pawnCount - opponentPawnCount) * 10;
+        
+        // 相连的兵有加成
+        pawnScore += connectedPawns * 5;
+        
+        return pawnScore;
+    }
+    
+    // 快速评估函数
+    int quickEvaluate(PieceColor perspective) const {
+        static const int pieceValues[] = {0, 10000, 25, 25, 45, 100, 50, 15};
+        int score = 0;
+        
+        for (int i = 0; i < 10; i++) {
+            for (int j = 0; j < 9; j++) {
+                Piece piece = getPiece(i, j);
+                if (piece.type != EMPTY) {
+                    int value = pieceValues[piece.type];
+                    if (piece.color == perspective) {
+                        score += value;
+                    } else {
+                        score -= value;
+                    }
+                }
+            }
+        }
+        
+        return score;
+    }
+};
+
+// 静态成员初始化
+uint64_t Board::zobristTable[Board::BOARD_SIZE][Board::NUM_PIECE_TYPES];
+uint64_t Board::zobristSide = 0;
+bool Board::zobristInitialized = false;
+
+// 增强版AI玩家类（重点避免送棋）
+class AI {
+private:
+    PieceColor color;
+    AIDifficulty difficulty;
+    int nodesEvaluated;
+    int maxSearchTime;      // 最大搜索时间（毫秒）
+    std::chrono::steady_clock::time_point startTime;
+    bool timeOut;
+    int visitedNodes;
+    
+    // 移动排序结构
+    struct ScoredMove {
+        Move move;
+        int score;
+        
+        bool operator<(const ScoredMove& other) const {
+            return score > other.score;  // 降序排序
+        }
+    };
+    
+public:
+    AI(PieceColor c, AIDifficulty d) : color(c), difficulty(d), 
+                                       nodesEvaluated(0), maxSearchTime(1000),
+                                       timeOut(false), visitedNodes(0) {}
+    
+    // 获取最佳移动（优化版，避免送棋）
+    Move getBestMove(const Board& board) {
+        nodesEvaluated = 0;
+        visitedNodes = 0;
+        timeOut = false;
+        
+        std::vector<Move> legalMoves = board.getAllLegalMoves(color);
+        
+        if (legalMoves.empty()) {
+            return Move();
+        }
+        
+        // 设置搜索时间限制
+        switch(difficulty) {
+            case LEVEL_1: maxSearchTime = 1000; break;   // 0.5秒
+            case LEVEL_2: maxSearchTime = 1000; break;  // 1秒
+            case LEVEL_3: maxSearchTime = 1000; break;  // 2秒
+            case LEVEL_4: maxSearchTime = 1000; break;  // 4秒
+        }
+        
+        startTime = std::chrono::steady_clock::now();
+        
+        Move bestMove;
+        
+        switch(difficulty) {
+            case LEVEL_1:  // 初级：增强的启发式
+                bestMove = getSmartHeuristicMove(board, legalMoves);
+                break;
+            case LEVEL_2:  // 中级：Minimax深度2
+                bestMove = getEnhancedMinimaxMove(board, legalMoves, 2);
+                break;
+            case LEVEL_3:  // 高级：Minimax深度3
+                bestMove = getEnhancedMinimaxMove(board, legalMoves, 3);
+                break;
+            case LEVEL_4:  // 专家：时间限制的深度搜索
+                bestMove = getTimeLimitedAdvancedMove(board, legalMoves);
+                break;
+            default:
+                bestMove = getSmartHeuristicMove(board, legalMoves);
+        }
+        
+        // 如果没有找到好着法，使用启发式选择
+        if (bestMove.fromRow == bestMove.toRow && bestMove.fromCol == bestMove.toCol) {
+            bestMove = getSmartHeuristicMove(board, legalMoves);
+        }
+        
+        // 最后安全检查：确保移动不会立即被吃掉
+        if (!isMoveSafe(board, bestMove)) {
+            // 寻找一个安全的替代移动
+            for (const Move& move : legalMoves) {
+                if (isMoveSafe(board, move)) {
+                    bestMove = move;
+                    bestMove.score = evaluateMoveSafety(board, move);
+                    break;
+                }
+            }
+        }
+        
+        return bestMove;
+    }
+    
+    void setDifficulty(AIDifficulty d) {
+        difficulty = d;
+    }
+    
+    int getNodesEvaluated() const {
+        return nodesEvaluated;
+    }
+    
+private:
+    // 超时检查
+    bool checkTimeOut() {
+        auto currentTime = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(currentTime - startTime);
+        return elapsed.count() >= maxSearchTime;
+    }
+    
+    // 检查移动是否安全（不会立即被吃掉）
+    bool isMoveSafe(const Board& board, const Move& move) const {
+        // 如果移动后棋子处于被攻击状态且没有足够保护，则认为不安全
+        Piece movedPiece = board.getPiece(move.fromRow, move.fromCol);
+        PieceColor opponentColor = (color == RED) ? BLACK : RED;
+        
+        // 模拟移动
+        Board testBoard = board.copy();
+        if (!testBoard.movePiece(move, color)) {
+            return false;
+        }
+        
+        // 检查移动后的棋子是否被攻击
+        if (testBoard.isSquareAttacked(move.toRow, move.toCol, opponentColor)) {
+            // 检查是否有保护
+            if (!testBoard.isSquareProtected(move.toRow, move.toCol, color)) {
+                return false;  // 被攻击且没有保护
+            }
+            
+            // 即使有保护，如果攻击者是低价值棋子，也可能是送子
+            // 这里简化处理，认为有保护就是安全的
+        }
+        
+        return true;
+    }
+    
+    // 评估移动的安全性
+    int evaluateMoveSafety(const Board& board, const Move& move) const {
+        int safetyScore = 100;  // 基础安全分
+        
+        Piece movedPiece = board.getPiece(move.fromRow, move.fromCol);
+        Piece targetPiece = board.getPiece(move.toRow, move.toCol);
+        PieceColor opponentColor = (color == RED) ? BLACK : RED;
+        
+        // 模拟移动
+        Board testBoard = board.copy();
+        if (!testBoard.movePiece(move, color)) {
+            return -1000;  // 非法移动
+        }
+        
+        // 1. 检查移动后是否被将军
+        if (testBoard.isInCheck(color)) {
+            safetyScore -= 500;  // 送将，严重扣分
+        }
+        
+        // 2. 检查移动后棋子是否被攻击
+        if (testBoard.isSquareAttacked(move.toRow, move.toCol, opponentColor)) {
+            safetyScore -= 100;  // 被攻击，扣分
+            
+            // 如果没有保护，扣更多分
+            if (!testBoard.isSquareProtected(move.toRow, move.toCol, color)) {
+                safetyScore -= 200;
+                
+                // 如果被低价值棋子攻击，更是送子
+                // 这里简化：如果移动的棋子价值高，扣更多分
+                if (movedPiece.getValue() > 50) {
+                    safetyScore -= 100;
+                }
+            }
+        }
+        
+        // 3. 检查是否送吃（移动后对方可以吃回等值或更高价值的棋子）
+        if (targetPiece.type != EMPTY) {
+            // 吃子通常是好的，除非...
+            if (movedPiece.getValue() < targetPiece.getValue() * 1.5) {
+                // 吃的子价值不高，但可能暴露自己
+                safetyScore += targetPiece.getValue();
+            }
+        }
+        
+        // 4. 检查是否暴露重要棋子
+        if (exposesImportantPiece(board, move)) {
+            safetyScore -= 150;
+        }
+        
+        // 5. 移动到安全位置加分
+        if (!testBoard.isSquareAttacked(move.toRow, move.toCol, opponentColor)) {
+            safetyScore += 50;
+        }
+        
+        return safetyScore;
+    }
+    
+    // 检查移动是否暴露重要棋子
+    bool exposesImportantPiece(const Board& board, const Move& move) const {
+        Piece movedPiece = board.getPiece(move.fromRow, move.fromCol);
+        
+        // 如果移动的是保护性棋子，检查是否暴露了后面的棋子
+        if (movedPiece.type == CHARIOT || movedPiece.type == CANNON || movedPiece.type == HORSE) {
+            // 简化处理：检查移动后是否让对方的车、炮有了新的攻击路线
+            PieceColor opponentColor = (color == RED) ? BLACK : RED;
+            
+            // 检查移动的棋子原来是否在保护某个重要位置
+            // 这里简化：如果移动的棋子原来在保护己方将/帅附近，扣分
+            int generalRow = -1, generalCol = -1;
+            for (int r = 0; r < 10; r++) {
+                for (int c = 0; c < 9; c++) {
+                    Piece piece = board.getPiece(r, c);
+                    if (piece.type == GENERAL && piece.color == color) {
+                        generalRow = r;
+                        generalCol = c;
+                        break;
+                    }
+                }
+                if (generalRow != -1) break;
+            }
+            
+            if (generalRow != -1) {
+                // 检查移动的棋子原来是否在将/帅的防御位置上
+                int distance = abs(move.fromRow - generalRow) + abs(move.fromCol - generalCol);
+                if (distance <= 3) {
+                    // 原来在将/帅附近，移动后可能暴露将/帅
+                    Board testBoard = board.copy();
+                    testBoard.movePiece(move, color);
+                    
+                    // 检查移动后是否更容易攻击将/帅
+                    if (testBoard.isSquareAttacked(generalRow, generalCol, opponentColor)) {
+                        return true;
+                    }
+                }
+            }
+        }
+        
+        return false;
+    }
+    
+    // 智能启发式移动选择（避免送棋）
+    Move getSmartHeuristicMove(const Board& board, const std::vector<Move>& moves) const {
+        if (moves.empty()) return Move();
+        
+        std::vector<ScoredMove> scoredMoves;
+        
+        for (size_t i = 0; i < moves.size(); i++) {
+            const Move& move = moves[i];
+            int score = 0;
+            
+            // 基础分数：吃子价值
+            Piece target = board.getPiece(move.toRow, move.toCol);
+            if (target.type != EMPTY) {
+                score += target.getValue() * 3;  // 吃子奖励
+            }
+            
+            // 移动后是否将军
+            Board testBoard = board.copy();
+            if (testBoard.movePiece(move, color)) {
+                if (testBoard.isInCheck(color == RED ? BLACK : RED)) {
+                    score += 80;  // 将军奖励
+                }
+            }
+            
+            // 安全性评估（避免送棋的关键）
+            int safetyScore = evaluateMoveSafety(board, move);
+            score += safetyScore;
+            
+            // 棋子发展：移动到好位置
+            Piece movedPiece = board.getPiece(move.fromRow, move.fromCol);
+            score += getPositionScore(move.toRow, move.toCol, movedPiece.type, movedPiece.color);
+            
+            // 棋子协调性
+            score += evaluateMoveCoordination(board, move);
+            
+            // 避免重复移动（防止AI在原地来回移动）
+            if (isRepeatMove(board, move)) {
+                score -= 30;
+            }
+            
+            // 兵/卒前进奖励
+            if (movedPiece.type == SOLDIER) {
+                if ((color == RED && move.toRow < move.fromRow) || 
+                    (color == BLACK && move.toRow > move.fromRow)) {
+                    score += 20;  // 前进奖励
+                }
+            }
+            
+            scoredMoves.push_back((ScoredMove){move, score});
+        }
+        
+        std::sort(scoredMoves.begin(), scoredMoves.end());
+        
+        // 返回最佳移动，但要确保不是明显送棋的
+        for (size_t i = 0; i < std::min((size_t)5, scoredMoves.size()); i++) {
+            if (isMoveSafe(board, scoredMoves[i].move)) {
+                return scoredMoves[i].move;
+            }
+        }
+        
+        // 如果没有安全移动，返回最佳移动
+        return scoredMoves[0].move;
+    }
+    
+    // 获取位置分数
+    int getPositionScore(int row, int col, PieceType type, PieceColor color) const {
+        // 简化的位置评分表
+        if (type == HORSE) {
+            // 马在中心区域较好
+            if (row >= 3 && row <= 6 && col >= 3 && col <= 5) {
+                return 15;
+            }
+        } else if (type == CHARIOT) {
+            // 车在开放线上较好
+            if (col == 0 || col == 8) {
+                return 10;  // 边线
+            }
+            if (col == 4) {
+                return 15;  // 中线
+            }
+        } else if (type == CANNON) {
+            // 炮在河界附近较好
+            if (row == 4 || row == 5) {
+                return 10;
+            }
+        } else if (type == SOLDIER) {
+            // 兵过河奖励
+            if ((color == RED && row <= 4) || (color == BLACK && row >= 5)) {
+                return 15;
+            }
+        }
+        
+        return 0;
+    }
+    
+    // 评估移动的协调性
+    int evaluateMoveCoordination(const Board& board, const Move& move) const {
+        int coordination = 0;
+        Piece movedPiece = board.getPiece(move.fromRow, move.fromCol);
+        
+        // 检查移动后是否能和其他棋子配合
+        if (movedPiece.type == CHARIOT || movedPiece.type == CANNON) {
+            // 车炮配合：如果移动后能和另一个车或炮形成火力交叉
+            for (int r = 0; r < 10; r++) {
+                for (int c = 0; c < 9; c++) {
+                    if (r == move.fromRow && c == move.fromCol) continue;
+                    
+                    Piece piece = board.getPiece(r, c);
+                    if (piece.color == color && 
+                        (piece.type == CHARIOT || piece.type == CANNON)) {
+                        // 检查是否在同一行或同一列
+                        if (move.toRow == r || move.toCol == c) {
+                            coordination += 10;
+                        }
+                    }
+                }
+            }
+        } else if (movedPiece.type == HORSE) {
+            // 马和车炮配合
+            for (int r = 0; r < 10; r++) {
+                for (int c = 0; c < 9; c++) {
+                    if (r == move.fromRow && c == move.fromCol) continue;
+                    
+                    Piece piece = board.getPiece(r, c);
+                    if (piece.color == color && 
+                        (piece.type == CHARIOT || piece.type == CANNON)) {
+                        // 检查马是否在车炮的攻击范围内
+                        int distance = abs(move.toRow - r) + abs(move.toCol - c);
+                        if (distance <= 3) {
+                            coordination += 8;
+                        }
+                    }
+                }
+            }
+        }
+        
+        return coordination;
+    }
+    
+    // 检查是否是重复移动
+    bool isRepeatMove(const Board& board, const Move& move) const {
+        // 简化处理：检查移动的棋子是否最近移动过
+        // 这里只是示例，实际实现需要记录历史
+        return false;
+    }
+    
+    // 增强的Minimax搜索
+    Move getEnhancedMinimaxMove(const Board& board, const std::vector<Move>& moves, int depth) {
+        if (moves.empty() || depth <= 0) return getSmartHeuristicMove(board, moves);
+        
+        Move bestMove = moves[0];
+        int bestScore = std::numeric_limits<int>::min();
+        
+        // 先进行移动排序
+        std::vector<ScoredMove> scoredMoves;
+        for (size_t i = 0; i < moves.size(); i++) {
+            const Move& move = moves[i];
+            int score = evaluateMoveSafety(board, move);
+            Piece target = board.getPiece(move.toRow, move.toCol);
+            score += target.getValue() * 2;
+            scoredMoves.push_back((ScoredMove){move, score});
+        }
+        std::sort(scoredMoves.begin(), scoredMoves.end());
+        
+        // 限制搜索的移动数量（提高效率）
+        int searchLimit = std::min(15, (int)scoredMoves.size());
+        
+        for (int i = 0; i < searchLimit; i++) {
+            const Move& move = scoredMoves[i].move;
+            Board testBoard = board.copy();
+            if (!testBoard.movePiece(move, color)) continue;
+            
+            int score = enhancedMinimax(testBoard, depth - 1, false, 
+                                       std::numeric_limits<int>::min(),
+                                       std::numeric_limits<int>::max(),
+                                       true);
+            
+            if (score > bestScore) {
+                bestScore = score;
+                bestMove = move;
+                bestMove.score = score;
+            }
+        }
+        
+        return bestMove;
+    }
+    
+    int enhancedMinimax(Board& board, int depth, bool maximizingPlayer, int alpha, int beta, bool useQuiescence) {
+        nodesEvaluated++;
+        
+        if (checkTimeOut() || depth == 0) {
+            // 使用静态局面评估
+            int eval = board.evaluate(color);
+            
+            // 如果需要，进行静态交换评估（避免送棋的关键）
+            if (useQuiescence && depth == 0 && abs(eval) < 500) {
+                eval = quiescenceSearch(board, 3, alpha, beta, maximizingPlayer);
+            }
+            
+            return eval;
+        }
+        
+        GameState state = board.checkGameState(maximizingPlayer ? color : (color == RED ? BLACK : RED));
+        if (state != PLAYING) {
+            return getTerminalScore(state);
+        }
+        
+        PieceColor currentPlayer = maximizingPlayer ? color : (color == RED ? BLACK : RED);
+        std::vector<Move> legalMoves = board.getAllLegalMoves(currentPlayer);
+        
+        if (legalMoves.empty()) {
+            return maximizingPlayer ? -10000 : 10000;
+        }
+        
+        // 移动排序：吃子优先，安全性高的优先
+        std::vector<ScoredMove> scoredMoves;
+        for (size_t i = 0; i < legalMoves.size(); i++) {
+            const Move& move = legalMoves[i];
+            int score = 0;
+            Piece target = board.getPiece(move.toRow, move.toCol);
+            if (target.type != EMPTY) {
+                score += 10000 + target.getValue() * 2;
+            }
+            // 安全性评估
+            score += evaluateMoveSafety(board, move) / 10;
+            scoredMoves.push_back((ScoredMove){move, score});
+        }
+        std::sort(scoredMoves.begin(), scoredMoves.end());
+        
+        if (maximizingPlayer) {
+            int maxEval = std::numeric_limits<int>::min();
+            for (size_t i = 0; i < scoredMoves.size(); i++) {
+                const Move& move = scoredMoves[i].move;
+                Board testBoard = board.copy();
+                // 修复：传入当前玩家颜色
+                testBoard.movePiece(move, currentPlayer);
+                int eval = enhancedMinimax(testBoard, depth - 1, false, alpha, beta, useQuiescence);
+                maxEval = std::max(maxEval, eval);
+                alpha = std::max(alpha, eval);
+                if (beta <= alpha) {
+                    break;  // Beta剪枝
+                }
+            }
+            return maxEval;
+        } else {
+            int minEval = std::numeric_limits<int>::max();
+            for (size_t i = 0; i < scoredMoves.size(); i++) {
+                const Move& move = scoredMoves[i].move;
+                Board testBoard = board.copy();
+                // 修复：传入当前玩家颜色
+                testBoard.movePiece(move, currentPlayer);
+                int eval = enhancedMinimax(testBoard, depth - 1, true, alpha, beta, useQuiescence);
+                minEval = std::min(minEval, eval);
+                beta = std::min(beta, eval);
+                if (beta <= alpha) {
+                    break;  // Alpha剪枝
+                }
+            }
+            return minEval;
+        }
+    }
+    
+    // 静态交换评估（Quiescence Search）
+    int quiescenceSearch(Board& board, int depth, int alpha, int beta, bool maximizingPlayer) {
+        nodesEvaluated++;
+        
+        // 基础评估
+        int standPat = board.evaluate(color);
+        
+        if (depth == 0) {
+            return standPat;
+        }
+        
+        if (maximizingPlayer) {
+            if (standPat >= beta) return beta;
+            if (alpha < standPat) alpha = standPat;
+        } else {
+            if (standPat <= alpha) return alpha;
+            if (beta > standPat) beta = standPat;
+        }
+        
+        // 只生成吃子移动
+        std::vector<Move> captureMoves;
+        PieceColor currentPlayer = maximizingPlayer ? color : (color == RED ? BLACK : RED);
+        std::vector<Move> allMoves = board.getAllLegalMoves(currentPlayer);
+        
+        for (const Move& move : allMoves) {
+            Piece target = board.getPiece(move.toRow, move.toCol);
+            if (target.type != EMPTY) {
+                captureMoves.push_back(move);
+            }
+        }
+        
+        // 对吃子移动排序（价值高的在前）
+        std::sort(captureMoves.begin(), captureMoves.end(),
+            [&](const Move& a, const Move& b) {
+                Piece targetA = board.getPiece(a.toRow, a.toCol);
+                Piece targetB = board.getPiece(b.toRow, b.toCol);
+                return targetA.getValue() > targetB.getValue();
+            });
+        
+        if (maximizingPlayer) {
+            for (const Move& move : captureMoves) {
+                // 只搜索有利的吃子（避免送棋）
+                Piece movedPiece = board.getPiece(move.fromRow, move.fromCol);
+                Piece target = board.getPiece(move.toRow, move.toCol);
+                
+                // 如果吃子不利（被吃价值更高），跳过
+                if (movedPiece.getValue() > target.getValue() * 1.5) {
+                    continue;
+                }
+                
+                Board testBoard = board.copy();
+                // 修复：传入当前玩家颜色
+                testBoard.movePiece(move, currentPlayer);
+                int score = quiescenceSearch(testBoard, depth - 1, alpha, beta, false);
+                
+                if (score >= beta) return beta;
+                if (score > alpha) alpha = score;
+            }
+            return alpha;
+        } else {
+            for (const Move& move : captureMoves) {
+                // 只搜索有利的吃子
+                Piece movedPiece = board.getPiece(move.fromRow, move.fromCol);
+                Piece target = board.getPiece(move.toRow, move.toCol);
+                
+                if (movedPiece.getValue() > target.getValue() * 1.5) {
+                    continue;
+                }
+                
+                Board testBoard = board.copy();
+                // 修复：传入当前玩家颜色
+                testBoard.movePiece(move, currentPlayer);
+                int score = quiescenceSearch(testBoard, depth - 1, alpha, beta, true);
+                
+                if (score <= alpha) return alpha;
+                if (score < beta) beta = score;
+            }
+            return beta;
+        }
+    }
+    
+    // 时间限制的高级搜索
+    Move getTimeLimitedAdvancedMove(const Board& board, const std::vector<Move>& moves) {
+        if (moves.empty()) return Move();
+        
+        // 先进行快速评估排序
+        std::vector<ScoredMove> scoredMoves;
+        for (size_t i = 0; i < moves.size(); i++) {
+            const Move& move = moves[i];
+            int score = evaluateMoveSafety(board, move) * 2;  // 安全性权重更高
+            Piece target = board.getPiece(move.toRow, move.toCol);
+            score += target.getValue() * 3;
+            scoredMoves.push_back((ScoredMove){move, score});
+        }
+        std::sort(scoredMoves.begin(), scoredMoves.end());
+        
+        // 限制搜索的移动数量
+        int searchLimit = std::min(10, (int)scoredMoves.size());
+        
+        Move bestMove = scoredMoves[0].move;
+        int bestScore = std::numeric_limits<int>::min();
+        
+        // 迭代深化搜索
+        for (int depth = 1; depth <= 5 && !checkTimeOut(); depth++) {
+            int currentBestScore = std::numeric_limits<int>::min();
+            Move currentBestMove = bestMove;
+            
+            // 对前几个最佳着法进行深度搜索
+            for (int i = 0; i < searchLimit && !checkTimeOut(); i++) {
+                const Move& move = scoredMoves[i].move;
+                
+                Board testBoard = board.copy();
+                if (!testBoard.movePiece(move, color)) continue;
+                
+                int score = timeLimitedAdvancedSearch(testBoard, depth, false,  // 深度递增
+                                                     std::numeric_limits<int>::min(),
+                                                     std::numeric_limits<int>::max());
+                
+                if (score > currentBestScore) {
+                    currentBestScore = score;
+                    currentBestMove = move;
+                    currentBestMove.score = score;
+                }
+            }
+            
+            if (!checkTimeOut() && currentBestScore > bestScore) {
+                bestScore = currentBestScore;
+                bestMove = currentBestMove;
+            }
+            
+            // 如果找到明显优势，提前终止
+            if (bestScore > 500) {
+                break;
+            }
+        }
+        
+        return bestMove;
+    }
+    
+    int timeLimitedAdvancedSearch(Board& board, int depth, bool maximizingPlayer, int alpha, int beta) {
+        nodesEvaluated++;
+        
+        if (checkTimeOut() || depth == 0) {
+            return board.evaluate(color);
+        }
+        
+        GameState state = board.checkGameState(maximizingPlayer ? color : (color == RED ? BLACK : RED));
+        if (state != PLAYING) {
+            return getTerminalScore(state);
+        }
+        
+        PieceColor currentPlayer = maximizingPlayer ? color : (color == RED ? BLACK : RED);
+        std::vector<Move> legalMoves = board.getAllLegalMoves(currentPlayer);
+        
+        if (legalMoves.empty()) {
+            return maximizingPlayer ? -10000 : 10000;
+        }
+        
+        // 移动排序
+        std::vector<ScoredMove> scoredMoves;
+        for (size_t i = 0; i < legalMoves.size(); i++) {
+            const Move& move = legalMoves[i];
+            int score = 0;
+            Piece target = board.getPiece(move.toRow, move.toCol);
+            score += target.getValue();
+            // 安全性考虑
+            score += evaluateMoveSafety(board, move) / 20;
+            scoredMoves.push_back((ScoredMove){move, score});
+        }
+        std::sort(scoredMoves.begin(), scoredMoves.end());
+        
+        if (maximizingPlayer) {
+            int maxEval = std::numeric_limits<int>::min();
+            for (size_t i = 0; i < scoredMoves.size(); i++) {
+                if (checkTimeOut()) break;
+                
+                const Move& move = scoredMoves[i].move;
+                Board testBoard = board.copy();
+                // 修复：传入当前玩家颜色
+                testBoard.movePiece(move, currentPlayer);
+                int eval = timeLimitedAdvancedSearch(testBoard, depth - 1, false, alpha, beta);
+                maxEval = std::max(maxEval, eval);
+                alpha = std::max(alpha, eval);
+                if (beta <= alpha) break;
+            }
+            return maxEval;
+        } else {
+            int minEval = std::numeric_limits<int>::max();
+            for (size_t i = 0; i < scoredMoves.size(); i++) {
+                if (checkTimeOut()) break;
+                
+                const Move& move = scoredMoves[i].move;
+                Board testBoard = board.copy();
+                // 修复：传入当前玩家颜色
+                testBoard.movePiece(move, currentPlayer);
+                int eval = timeLimitedAdvancedSearch(testBoard, depth - 1, true, alpha, beta);
+                minEval = std::min(minEval, eval);
+                beta = std::min(beta, eval);
+                if (beta <= alpha) break;
+            }
+            return minEval;
+        }
+    }
+    
+    // 获取终局分数
+    int getTerminalScore(GameState state) const {
+        if ((state == RED_WIN && color == RED) ||
+            (state == BLACK_WIN && color == BLACK)) {
+            return 10000;
+        } else if ((state == RED_WIN && color == BLACK) ||
+                  (state == BLACK_WIN && color == RED)) {
+            return -10000;
+        } else {
+            return 0;
+        }
+    }
+};
+
+// 游戏类
+class Game {
+private:
+    Board board;
+    GameState state;
+    PieceColor currentPlayer;
+    AIDifficulty redAIDifficulty;
+    AIDifficulty blackAIDifficulty;
+    bool redIsAI;
+    bool blackIsAI;
+    std::vector<std::string> gameLog;
+    std::vector<Move> moveHistory;
+    
+public:
+    Game() : state(PLAYING), currentPlayer(RED), 
+             redAIDifficulty(LEVEL_3), blackAIDifficulty(LEVEL_3),
+             redIsAI(false), blackIsAI(false) {}
+    
+    // 设置游戏模式
+    void setGameMode(int mode, PieceColor playerColor = RED) {
+        switch(mode) {
+            case 1:  // 玩家 vs 玩家
+                redIsAI = false;
+                blackIsAI = false;
+                break;
+            case 2:  // 玩家 vs AI
+                if (playerColor == RED) {
+                    redIsAI = false;
+                    blackIsAI = true;
+                } else {
+                    redIsAI = true;
+                    blackIsAI = false;
+                }
+                break;
+            case 3:  // AI vs AI
+                redIsAI = true;
+                blackIsAI = true;
+                break;
+        }
+    }
+    
+    // 设置AI难度
+    void setAIDifficulty(PieceColor color, AIDifficulty difficulty) {
+        if (color == RED) {
+            redAIDifficulty = difficulty;
+        } else {
+            blackAIDifficulty = difficulty;
+        }
+    }
+    
+    // 显示游戏信息
+    void displayGameInfo() {
+        Color::setColor(Color::CYAN);
+        std::cout << "=== 游戏信息 ===\n";
+        std::cout << "游戏阶段: ";
+        
+        GamePhase phase = board.getGamePhase();
+        switch(phase) {
+            case OPENING: std::cout << "开局"; break;
+            case MIDGAME: std::cout << "中局"; break;
+            case ENDGAME: std::cout << "残局"; break;
+        }
+        
+        // 检查重复局面
+        int repetitionCount = board.getRepetitionCount();
+        if (repetitionCount >= 2) {
+            std::cout << " [重复" << repetitionCount << "次]";
+        }
+        
+        // 检查50步规则
+        int fiftyMoveCounter = board.getFiftyMoveCounter();
+        if (fiftyMoveCounter >= 50) {
+            std::cout << " [50步规则: " << fiftyMoveCounter << "/100]";
+        }
+        
+        if (board.isInCheck(currentPlayer)) {
+            Color::setColor(Color::RED);
+            std::cout << " [将军!]";
+            Color::setColor(Color::CYAN);
+        }
+        
+        // 显示当前局面评估
+        int redEval = board.evaluate(RED);
+        std::cout << "\n局面评估: ";
+        if (redEval > 50) std::cout << "红方优势";
+        else if (redEval < -50) std::cout << "黑方优势";
+        else std::cout << "均势";
+        std::cout << " (" << redEval << ")";
+        
+        std::cout << "\n=== === === ===";
+        Color::reset();
+    }
+    
+    // 开始游戏
+    void start() {
+        Color::setColor(Color::MAGENTA);
+        std::cout << "=========================================\n";
+        std::cout << "  中国象棋游戏（增强AI版，避免送棋）\n";
+        std::cout << "  GNU C++11兼容版 - 已修复移动敌方棋子问题\n";
+        std::cout << "=========================================\n\n";
+        Color::reset();
+        
+        // 显示游戏规则说明
+        Color::setColor(Color::YELLOW);
+        std::cout << "游戏规则说明:\n";
+        std::cout << "1. 红方先手，黑方后手\n";
+        std::cout << "2. 将/帅只能在九宫格内移动\n";
+        std::cout << "3. 特殊规则：'飞将' - 当将帅在同一直线上且中间无子时，可以直接吃掉对方将帅\n";
+        std::cout << "4. 马走日，象走田，车走直线，炮隔山打牛\n";
+        std::cout << "5. 兵/卒过河前只能前进，过河后可左右移动\n";
+        std::cout << "6. 三次重复局面判和\n";
+        std::cout << "7. 50回合未吃子且无兵移动判和\n";
+        std::cout << "8. 双方无足够进攻子力判和\n";
+        std::cout << "=========================================\n\n";
+        Color::reset();
+        
+        // 选择游戏模式
+        int mode;
+        Color::setColor(Color::YELLOW);
+        std::cout << "选择游戏模式:\n";
+        std::cout << "1. 玩家 vs 玩家\n";
+        std::cout << "2. 玩家 vs AI\n";
+        std::cout << "3. AI vs AI\n";
+        std::cout << "请选择 (1-3): ";
+        Color::reset();
+        std::cin >> mode;
+        
+        PieceColor playerColor = RED;
+        
+        if (mode == 2) {
+            int colorChoice;
+            Color::setColor(Color::YELLOW);
+            std::cout << "\n选择您的颜色:\n";
+            std::cout << "1. 红方（先手）\n";
+            std::cout << "2. 黑方（后手）\n";
+            std::cout << "请选择 (1-2): ";
+            Color::reset();
+            std::cin >> colorChoice;
+            
+            playerColor = (colorChoice == 1) ? RED : BLACK;
+        }
+        
+        setGameMode(mode, playerColor);
+        
+        // 选择AI难度
+        if (redIsAI || blackIsAI) {
+            Color::setColor(Color::YELLOW);
+            std::cout << "\nAI难度级别说明:\n";
+            std::cout << "1. 初级 - 简单启发式 (约1秒)\n";
+            std::cout << "2. 中级 - Minimax搜索深度2 (约1秒)\n";
+            std::cout << "3. 高级 - Minimax搜索深度3 (约1秒)\n";
+            std::cout << "4. 专家 - 时间限制搜索深度4+ (约1秒)\n\n";
+            Color::reset();
+            
+            if (redIsAI) {
+                int difficulty;
+                Color::setColor(Color::RED);
+                std::cout << "选择红方AI难度 (1-4): ";
+                Color::reset();
+                std::cin >> difficulty;
+                if (difficulty >= 1 && difficulty <= 4) {
+                    setAIDifficulty(RED, static_cast<AIDifficulty>(difficulty));
+                }
+            }
+            
+            if (blackIsAI) {
+                int difficulty;
+                Color::setColor(Color::BLACK);
+                std::cout << "选择黑方AI难度 (1-4): ";
+                Color::reset();
+                std::cin >> difficulty;
+                if (difficulty >= 1 && difficulty <= 4) {
+                    setAIDifficulty(BLACK, static_cast<AIDifficulty>(difficulty));
+                }
+            }
+        }
+        
+        Color::setColor(Color::CYAN);
+        std::cout << "\n游戏开始！\n";
+        
+        if (mode == 2) {
+            std::cout << "玩家: " << (playerColor == RED ? "红方" : "黑方") << "\n";
+            std::cout << "AI: " << (playerColor == RED ? "黑方" : "红方") 
+                      << " (难度: " << (playerColor == RED ? blackAIDifficulty : redAIDifficulty) << ")\n";
+        } else {
+            std::cout << "红方: " << (redIsAI ? "AI" : "玩家") 
+                      << " (难度: " << redAIDifficulty << ")\n";
+            std::cout << "黑方: " << (blackIsAI ? "AI" : "玩家") 
+                      << " (难度: " << blackAIDifficulty << ")\n";
+        }
+        
+        std::cout << "\n提示：输入99 0查看特殊命令\n\n";
+        Color::reset();
+        
+        // 游戏主循环
+        while (state == PLAYING) {
+            board.display();
+            displayGameInfo();
+            
+            Color::setColor(currentPlayer == RED ? Color::RED : Color::BLACK);
+            std::cout << "\n当前回合: " 
+                      << (currentPlayer == RED ? "红方" : "黑方") ;
+            Color::reset();
+            
+            bool isCurrentPlayerAI = (currentPlayer == RED && redIsAI) || 
+                                     (currentPlayer == BLACK && blackIsAI);
+            if (isCurrentPlayerAI) {
+                Color::setColor(Color::YELLOW);
+                std::cout << "(AI回合)\n";
+                Color::reset();
+            } else {
+                Color::setColor(Color::GREEN);
+                std::cout << "(玩家回合)\n";
+                Color::reset();
+            }
+            
+            // 获取移动
+            Move move;
+            if (isCurrentPlayerAI) {
+                // AI移动
+                Color::setColor(Color::YELLOW);
+                std::cout << "AI正在思考...\n";
+                Color::reset();
+                
+                std::chrono::steady_clock::time_point aiStartTime = std::chrono::steady_clock::now();
+                
+                AI ai(currentPlayer, (currentPlayer == RED) ? redAIDifficulty : blackAIDifficulty);
+                move = ai.getBestMove(board);
+                
+                std::chrono::steady_clock::time_point aiEndTime = std::chrono::steady_clock::now();
+                std::chrono::milliseconds aiDuration = std::chrono::duration_cast<std::chrono::milliseconds>(aiEndTime - aiStartTime);
+                
+                if (move.fromRow == move.toRow && move.fromCol == move.toCol) {
+                    std::cout << "AI没有找到合法移动！\n";
+                    state = (currentPlayer == RED) ? BLACK_WIN : RED_WIN;
+                    break;
+                }
+                
+                Color::setColor(Color::GREEN);
+                std::cout << "AI移动: (" << move.fromRow << "," << move.fromCol 
+                          << ") -> (" << move.toRow << "," << move.toCol << ")";
+                if (move.score != 0) {
+                    std::cout << " [评分: " << move.score << "]";
+                }
+                
+                std::cout << " [思考时间: " << aiDuration.count() << "ms]";
+                std::cout << " [评估节点: " << ai.getNodesEvaluated() << "]\n";
+                
+                Piece targetPiece = board.getPiece(move.toRow, move.toCol);
+                if (targetPiece.type == GENERAL && targetPiece.color != currentPlayer) {
+                    std::cout << " [飞将!]";
+                }
+                
+                std::cout << "\n";
+                Color::reset();
+            } else {
+                // 玩家移动
+                move = getPlayerMove();
+                
+                if (move.fromRow == -1) {
+                    std::cout << "输入错误，请重新输入！\n";
+                    continue;
+                }
+                
+                if (move.fromRow == 99) {
+                    handleSpecialCommand(move.fromCol);
+                    continue;
+                }
+                
+                // 修复：检查玩家是否移动自己的棋子
+                Piece movedPiece = board.getPiece(move.fromRow, move.fromCol);
+                if (movedPiece.color != currentPlayer) {
+                    Color::setColor(Color::RED);
+                    std::cout << "错误：不能移动对方的棋子！\n";
+                    Color::reset();
+                    continue;
+                }
+            }
+            
+            // 执行移动（修复：传入当前玩家颜色）
+            if (board.movePiece(move, currentPlayer)) {
+                // 记录移动历史
+                moveHistory.push_back(move);
+                
+                // 记录游戏日志
+                std::string moveStr = (currentPlayer == RED ? "红方: " : "黑方: ") +
+                                     std::to_string(move.fromRow) + "," + std::to_string(move.fromCol) +
+                                     " -> " + std::to_string(move.toRow) + "," + std::to_string(move.toCol);
+                
+                Piece targetPiece = board.getPiece(move.toRow, move.toCol);
+                Piece movedPiece = board.getPiece(move.fromRow, move.fromCol);
+                if (targetPiece.type != EMPTY) {
+                    moveStr += " 吃" + std::string(targetPiece.getName());
+                } else {
+                    moveStr += " 移动" + std::string(movedPiece.getName());
+                }
+                
+                if (targetPiece.type == GENERAL && targetPiece.color != currentPlayer) {
+                    moveStr += " [飞将!]";
+                }
+                
+                gameLog.push_back(moveStr);
+                
+                // 检查游戏状态
+                state = board.checkGameState(currentPlayer);
+                
+                // 显示特殊和棋信息
+                if (state == DRAW) {
+                    if (board.isThreefoldRepetition()) {
+                        Color::setColor(Color::YELLOW);
+                        std::cout << "三次重复局面，和棋！\n";
+                        Color::reset();
+                    } else if (board.isFiftyMoveRuleDraw()) {
+                        Color::setColor(Color::YELLOW);
+                        std::cout << "50回合未吃子且无兵移动，和棋！\n";
+                        Color::reset();
+                    } else if (board.isInsufficientMaterial()) {
+                        Color::setColor(Color::YELLOW);
+                        std::cout << "双方无足够进攻子力，和棋！\n";
+                        Color::reset();
+                    }
+                } else if (state != PLAYING) {
+                    Piece targetPiece = board.getPiece(move.toRow, move.toCol);
+                    if (targetPiece.type == GENERAL && targetPiece.color != currentPlayer) {
+                        Color::setColor(Color::MAGENTA);
+                        std::cout << "\n飞将成功！";
+                        Color::reset();
+                    }
+                }
+                
+                // 切换玩家
+                currentPlayer = (currentPlayer == RED) ? BLACK : RED;
+            } else {
+                Color::setColor(Color::RED);
+                std::cout << "非法移动，请重试！\n";
+                Color::reset();
+            }
+        }
+        
+        // 显示游戏结果
+        board.display();
+        Color::setColor(Color::MAGENTA);
+        std::cout << "\n游戏结束！\n";
+        switch(state) {
+            case RED_WIN:
+                std::cout << "红方获胜！\n";
+                break;
+            case BLACK_WIN:
+                std::cout << "黑方获胜！\n";
+                break;
+            case DRAW:
+                std::cout << "和棋！\n";
+                break;
+            default:
+                break;
+        }
+        Color::reset();
+        
+        // 显示游戏日志
+        std::cout << "\n游戏日志（共" << gameLog.size() << "步）:\n";
+        for (size_t i = 0; i < gameLog.size(); i++) {
+            std::cout << i+1 << ". " << gameLog[i] << "\n";
+        }
+        
+        // 显示统计信息
+        Color::setColor(Color::CYAN);
+        std::cout << "\n游戏统计:\n";
+        std::cout << "总步数: " << gameLog.size() << "\n";
+        std::cout << "重复局面次数: " << board.getRepetitionCount() << "\n";
+        std::cout << "50步规则计数器: " << board.getFiftyMoveCounter() << "\n";
+        Color::reset();
+    }
+    
+private:
+    // 获取玩家移动
+    Move getPlayerMove() {
+        int fromRow, fromCol, toRow, toCol;
+        
+        std::cout << "输入移动 (格式: 行 列 行 列)";
+        std::cout << " 或输入 99 0 查看特殊命令: ";
+        std::cin >> fromRow >> fromCol >> toRow >> toCol;
+        
+        if (!std::cin) {
+            std::cin.clear();
+            std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+            return Move(-1, -1, -1, -1);
+        }
+        
+        return Move(fromRow, fromCol, toRow, toCol);
+    }
+    
+    // 处理特殊命令
+    void handleSpecialCommand(int command) {
+        switch(command) {
+            case 0: // 显示帮助
+                Color::setColor(Color::CYAN);
+                std::cout << "\n特殊命令:\n";
+                std::cout << "99 0 - 显示帮助\n";
+                std::cout << "99 1 - 显示AI评估\n";
+                std::cout << "99 2 - 显示移动历史\n";
+                std::cout << "99 3 - 重新开始\n";
+                std::cout << "99 4 - 退出游戏\n";
+                std::cout << "99 5 - 切换AI难度\n";
+                std::cout << "99 6 - 显示游戏规则\n";
+                std::cout << "99 7 - 显示局面信息\n";
+                std::cout << "99 8 - 清空局面历史\n";
+                std::cout << "99 9 - 显示AI技术\n";
+                Color::reset();
+                break;
+                
+            case 1: // 显示AI评估
+                {
+                    Color::setColor(Color::GREEN);
+                    std::cout << "当前局面评估:\n";
+                    
+                    int redEval = board.evaluate(RED);
+                    std::cout << "红方视角: " << redEval;
+                    if (redEval > 50) std::cout << " (红方优势)";
+                    else if (redEval < -50) std::cout << " (黑方优势)";
+                    else std::cout << " (均势)";
+                    std::cout << "\n";
+                    
+                    int blackEval = board.evaluate(BLACK);
+                    std::cout << "黑方视角: " << blackEval;
+                    if (blackEval > 50) std::cout << " (黑方优势)";
+                    else if (blackEval < -50) std::cout << " (红方优势)";
+                    else std::cout << " (均势)";
+                    std::cout << "\n";
+                    
+                    // 显示棋子数量
+                    int redPieces = 0, blackPieces = 0;
+                    for (int i = 0; i < 10; i++) {
+                        for (int j = 0; j < 9; j++) {
+                            Piece piece = board.getPiece(i, j);
+                            if (piece.type != EMPTY) {
+                                if (piece.color == RED) redPieces++;
+                                else blackPieces++;
+                            }
+                        }
+                    }
+                    std::cout << "棋子数量: 红方" << redPieces << "个, 黑方" << blackPieces << "个\n";
+                    
+                    Color::reset();
+                }
+                break;
+                
+            case 2: // 显示游戏日志
+                {
+                    Color::setColor(Color::YELLOW);
+                    std::cout << "游戏日志:\n";
+                    for (size_t i = 0; i < gameLog.size(); i++) {
+                        std::cout << i+1 << ". " << gameLog[i] << "\n";
+                    }
+                    Color::reset();
+                }
+                break;
+                
+            case 3: // 重新开始
+                board.initializeBoard();
+                state = PLAYING;
+                currentPlayer = RED;
+                gameLog.clear();
+                moveHistory.clear();
+                std::cout << "游戏已重新开始\n";
+                break;
+                
+            case 4: // 退出游戏
+                state = (currentPlayer == RED) ? BLACK_WIN : RED_WIN;
+                std::cout << "游戏已退出\n";
+                break;
+                
+            case 5: // 切换AI难度
+                if (redIsAI || blackIsAI) {
+                    Color::setColor(Color::YELLOW);
+                    std::cout << "切换AI难度:\n";
+                    
+                    if (redIsAI) {
+                        int difficulty;
+                        std::cout << "红方AI当前难度: " << redAIDifficulty << "\n";
+                        std::cout << "输入新难度 (1-4): ";
+                        std::cin >> difficulty;
+                        if (difficulty >= 1 && difficulty <= 4) {
+                            redAIDifficulty = static_cast<AIDifficulty>(difficulty);
+                            std::cout << "红方AI难度已设置为: " << redAIDifficulty << "\n";
+                        } else {
+                            std::cout << "无效的难度级别\n";
+                        }
+                    }
+                    
+                    if (blackIsAI) {
+                        int difficulty;
+                        std::cout << "黑方AI当前难度: " << blackAIDifficulty << "\n";
+                        std::cout << "输入新难度 (1-4): ";
+                        std::cin >> difficulty;
+                        if (difficulty >= 1 && difficulty <= 4) {
+                            blackAIDifficulty = static_cast<AIDifficulty>(difficulty);
+                            std::cout << "黑方AI难度已设置为: " << blackAIDifficulty << "\n";
+                        } else {
+                            std::cout << "无效的难度级别\n";
+                        }
+                    }
+                    
+                    Color::reset();
+                } else {
+                    std::cout << "当前没有AI玩家\n";
+                }
+                break;
+                
+            case 6: // 显示游戏规则
+                {
+                    Color::setColor(Color::YELLOW);
+                    std::cout << "\n游戏规则说明:\n";
+                    std::cout << "1. 红方先手，黑方后手\n";
+                    std::cout << "2. 将/帅只能在九宫格内移动\n";
+                    std::cout << "3. 特殊规则：'飞将' - 当将帅在同一直线上且中间无子时，可以直接吃掉对方将帅\n";
+                    std::cout << "4. 马走日，象走田，车走直线，炮隔山打牛\n";
+                    std::cout << "5. 兵/卒过河前只能前进，过河后可左右移动\n";
+                    std::cout << "6. 士/仕只能在九宫格内斜着移动\n";
+                    std::cout << "7. 象/相不能过河\n";
+                    std::cout << "8. 将军时，被将军方必须解除将军状态\n";
+                    std::cout << "9. 无法解除将军则判负\n";
+                    std::cout << "10. 三次重复局面判和\n";
+                    std::cout << "11. 50回合未吃子且无兵移动判和\n";
+                    std::cout << "12. 双方无足够进攻子力判和\n";
+                    Color::reset();
+                }
+                break;
+                
+            case 7: // 显示局面信息
+                {
+                    Color::setColor(Color::CYAN);
+                    std::cout << "局面信息:\n";
+                    std::cout << "当前局面重复次数: " << board.getRepetitionCount() << "\n";
+                    std::cout << "50步规则计数器: " << board.getFiftyMoveCounter() << " / 100\n";
+                    std::cout << "游戏阶段: ";
+                    GamePhase phase = board.getGamePhase();
+                    switch(phase) {
+                        case OPENING: std::cout << "开局"; break;
+                        case MIDGAME: std::cout << "中局"; break;
+                        case ENDGAME: std::cout << "残局"; break;
+                    }
+                    std::cout << "\n";
+                    
+                    if (board.isThreefoldRepetition()) {
+                        std::cout << "警告：已达到三次重复局面！\n";
+                    }
+                    if (board.isFiftyMoveRuleDraw()) {
+                        std::cout << "警告：已达到50回合未吃子且无兵移动！\n";
+                    }
+                    if (board.isInsufficientMaterial()) {
+                        std::cout << "警告：双方可能无足够进攻子力！\n";
+                    }
+                    Color::reset();
+                }
+                break;
+                
+            case 8: // 清空局面历史
+                {
+                    board.resetPositionHistory();
+                    Color::setColor(Color::GREEN);
+                    std::cout << "局面历史已清空！\n";
+                    Color::reset();
+                }
+                break;
+                
+            case 9: // 显示AI技术
+                {
+                    Color::setColor(Color::CYAN);
+                    std::cout << "AI使用技术:\n";
+                    std::cout << "1. Alpha-Beta剪枝优化\n";
+                    std::cout << "2. 启发式移动排序（避免送棋）\n";
+                    std::cout << "3. 静态交换评估（Quiescence Search）\n";
+                    std::cout << "4. 迭代深化搜索\n";
+                    std::cout << "5. 时间限制搜索\n";
+                    std::cout << "6. 增强的评估函数（安全性优先）\n";
+                    std::cout << "7. 局面哈希和重复检测\n";
+                    std::cout << "8. 棋子安全性评估\n";
+                    std::cout << "9. 棋子协调性评估\n";
+                    std::cout << "10. 兵/卒结构评估\n";
+                    Color::reset();
+                }
+                break;
+                
+            default:
+                std::cout << "未知命令\n";
+                break;
+        }
+    }
+};
+
+// 主函数
+int main() {
+    Game game;
+    game.start();
+    
+    Color::setColor(Color::MAGENTA);
+    std::cout << "\n感谢游玩中国象棋增强AI版！\n";
+    Color::reset();
+    
+    return 0;
+}

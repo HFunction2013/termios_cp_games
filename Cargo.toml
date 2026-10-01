@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = [
+    "gamekit",
+    "minesweeper",
+    "chinese_chess",
+    "escape_school_81",
+    "escape_school_cracked",
+]
+
+[workspace.package]
+edition = "2021"
+version = "1.0.0"
+authors = ["Doubao"]
+
+[profile.release]
+opt-level = 2

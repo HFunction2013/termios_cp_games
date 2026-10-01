@@ -1,0 +1,7 @@
+[package]
+name = "minesweeper"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+gamekit = { path = "../gamekit" }

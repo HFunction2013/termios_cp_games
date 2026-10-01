@@ -1,0 +1,7 @@
+[package]
+name = "escape_school_81"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+gamekit = { path = "../gamekit" }

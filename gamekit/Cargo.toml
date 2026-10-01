@@ -1,0 +1,7 @@
+[package]
+name = "gamekit"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+crossterm = "0.28"
