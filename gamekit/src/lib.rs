@@ -8,7 +8,9 @@
 use std::io::{self, Write};
 use std::time::Duration;
 
-pub use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+pub use crossterm::event::{
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 
 /// 初始化终端（Windows 下启用 ANSI 虚拟终端支持；其他平台无操作）。
 /// 在输出任何 ANSI 转义序列之前调用一次。
@@ -284,6 +286,81 @@ pub fn read_line_cooked() -> Option<String> {
         Err(_) => None,
     }
 }
+
+// ---------------------------------------------------------------------------
+// 鼠标交互模式
+// ---------------------------------------------------------------------------
+
+/// 一次鼠标点击（按下瞬间的坐标与按键）。
+/// `column` / `row` 为 0 基坐标（左上角为 (0,0)，与光标位置一致）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MouseClick {
+    pub button: MouseButton,
+    pub column: u16,
+    pub row: u16,
+}
+
+/// 鼠标模式下读取到的一个交互事件：按键或鼠标点击。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputEvent {
+    Key(KeyCode),
+    Mouse(MouseClick),
+}
+
+/// 鼠标交互模式 RAII 守卫：进入原始模式并启用鼠标捕获，
+/// 离开作用域时自动禁用鼠标捕获、恢复原始终端并显示光标。
+pub struct MouseMode;
+
+impl MouseMode {
+    pub fn enter() -> io::Result<MouseMode> {
+        // 开启原始模式
+        crossterm::terminal::enable_raw_mode()?;
+        // 启用鼠标捕获
+        let _ = crossterm::execute!(
+            io::stdout(),
+            crossterm::event::EnableMouseCapture,
+            crossterm::terminal::Clear(crossterm::terminal::ClearType::All)
+        );
+        let _ = io::stdout().flush();
+        Ok(MouseMode)
+    }
+}
+
+impl Drop for MouseMode {
+    fn drop(&mut self) {
+        let _ = crossterm::execute!(io::stdout(), crossterm::event::DisableMouseCapture);
+        let _ = crossterm::terminal::disable_raw_mode();
+        let _ = io::stdout().write_all(b"\x1b[?25h");
+        let _ = io::stdout().flush();
+    }
+}
+
+/// 阻塞读取一个按键或鼠标点击（仅响应按下类事件）。
+/// 鼠标按下返回 `InputEvent::Mouse`，按键按下返回 `InputEvent::Key`。
+/// 出错 / EOF 时返回 None。
+pub fn read_key_or_mouse() -> Option<InputEvent> {
+    loop {
+        match crossterm::event::read() {
+            Ok(Event::Key(ke)) => {
+                if matches!(ke.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+                    return Some(InputEvent::Key(ke.code));
+                }
+            }
+            Ok(Event::Mouse(me)) => {
+                if let MouseEventKind::Down(button) = me.kind {
+                    return Some(InputEvent::Mouse(MouseClick {
+                        button,
+                        column: me.column,
+                        row: me.row,
+                    }));
+                }
+            }
+            Ok(_) => continue,
+            Err(_) => return None,
+        }
+    }
+}
+
 
 /// 在原始模式下读取单个按键并判断是否为 Y/N（用于“是否回档”等提示）。
 /// 返回 'Y' 或 'N'；EOF/出错时返回 'N'。
