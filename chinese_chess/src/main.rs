@@ -10,6 +10,7 @@
 //!   迭代深化、时间限制搜索、Zobrist 局面哈希与重复检测
 
 use gamekit;
+use gamekit::{InputEvent, KeyCode, MouseButton, MouseMode};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
@@ -177,12 +178,12 @@ impl Piece {
         self.ptype == PieceType::Empty || self.color == PieceColor::None
     }
 
-    /// 带颜色的棋子名称
-    fn name(&self) -> String {
+    /// 棋子字符（不带颜色，用于鼠标模式的落点/选中标记着色）
+    fn glyph(&self) -> &'static str {
         if self.is_empty() {
-            return "  ".to_string();
+            return "  ";
         }
-        let name = if self.color == PieceColor::Red {
+        if self.color == PieceColor::Red {
             match self.ptype {
                 PieceType::General => "帅",
                 PieceType::Advisor => "仕",
@@ -204,13 +205,20 @@ impl Piece {
                 PieceType::Soldier => "卒",
                 _ => "  ",
             }
-        };
+        }
+    }
+
+    /// 带颜色的棋子名称
+    fn name(&self) -> String {
+        if self.is_empty() {
+            return "  ".to_string();
+        }
         let color_code = if self.color == PieceColor::Red {
             gamekit::color::RED
         } else {
             gamekit::color::GRAY
         };
-        format!("{}{}{}", color_code, name, gamekit::color::RESET)
+        format!("{}{}{}", color_code, self.glyph(), gamekit::color::RESET)
     }
 
     /// 字母表示（保留原版接口）
@@ -2620,6 +2628,40 @@ impl AI {
 // 游戏流程
 // ---------------------------------------------------------------------------
 
+/// 鼠标模式下棋盘的屏幕布局：记录每行棋盘内容所在屏幕行（0 基）、
+/// 每个格子内容起止列（0 基，含内容后的一个空格，不含格线），
+/// 用于把终端点击坐标映射回棋盘格。
+struct BoardLayout {
+    rows: [i32; 10],
+    cells: [[(i32, i32); 9]; 10],
+}
+
+impl BoardLayout {
+    fn new() -> BoardLayout {
+        BoardLayout {
+            rows: [0; 10],
+            cells: [[(0, 0); 9]; 10],
+        }
+    }
+
+    /// 把终端点击坐标（0 基，与光标位置一致）映射为棋盘 (行, 列)；不在棋盘上返回 None。
+    fn cell_at(&self, column: u16, row: u16) -> Option<(i32, i32)> {
+        let x = column as i32;
+        let y = row as i32;
+        for i in 0..10 {
+            if self.rows[i] == y {
+                for j in 0..9 {
+                    let (start, width) = self.cells[i][j];
+                    if x >= start && x < start + width + 1 {
+                        return Some((i as i32, j as i32));
+                    }
+                }
+            }
+        }
+        None
+    }
+}
+
 struct Game {
     board: Board,
     state: GameState,
@@ -2632,6 +2674,8 @@ struct Game {
     move_history: Vec<Move>,
     exited: bool,
     end_reason: String,
+    /// 鼠标模式下显示在棋盘下方的提示信息（走子结果 / 错误 / AI 动态等）
+    status: String,
 }
 
 impl Game {
@@ -2648,6 +2692,7 @@ impl Game {
             move_history: Vec::new(),
             exited: false,
             end_reason: String::new(),
+            status: String::new(),
         }
     }
 
@@ -2760,7 +2805,9 @@ impl Game {
         println!("17. 双方均无进攻子力（车马炮兵）判和。");
     }
 
-    fn start(&mut self) {
+    /// 开场菜单：标题、规则、模式选择、颜色选择、AI 难度设置（键盘输入）。
+    /// 键盘（legacy）与鼠标两种模式共用。
+    fn setup(&mut self) {
         let magenta = gamekit::color::MAGENTA;
         let yellow = gamekit::color::YELLOW;
         let reset = gamekit::color::RESET;
@@ -2860,6 +2907,14 @@ impl Game {
         }
 
         println!("\n提示：输入 99 0 查看特殊命令\n");
+    }
+
+    fn start(&mut self) {
+        let magenta = gamekit::color::MAGENTA;
+        let yellow = gamekit::color::YELLOW;
+        let reset = gamekit::color::RESET;
+
+        self.setup();
 
         // 游戏主循环
         while self.state == GameState::Playing && !self.exited {
@@ -3036,6 +3091,378 @@ impl Game {
             "50回合规则计数器: {} / 100 步",
             self.board.get_fifty_move_counter()
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // 鼠标交互模式
+    // -----------------------------------------------------------------------
+
+    /// 渲染一帧鼠标模式画面：棋盘（选中棋子紫色、可落点蓝色标记）+ 回合/提示。
+    /// 返回 (画面字符串, 棋盘布局)，布局用于把终端点击坐标映射回棋盘格。
+    fn render_mouse(&self, selected: Option<(i32, i32)>) -> (String, BoardLayout) {
+        let y = gamekit::color::YELLOW;
+        let r = gamekit::color::RESET;
+        let magenta = gamekit::color::MAGENTA;
+        let blue = gamekit::color::BLUE;
+        let green = gamekit::color::GREEN;
+        let red = gamekit::color::RED;
+        let cyan = gamekit::color::CYAN;
+        let gray = gamekit::color::GRAY;
+        let yellow = gamekit::color::YELLOW;
+
+        // 收集选中棋子的合法落点（用于蓝色标记）
+        let mut dests: Vec<(i32, i32)> = Vec::new();
+        if let Some((sr, sc)) = selected {
+            if self.board.get_piece(sr, sc).color == self.current_player {
+                dests = self
+                    .board
+                    .get_all_legal_moves(self.current_player)
+                    .into_iter()
+                    .filter(|m| m.from_row == sr && m.from_col == sc)
+                    .map(|m| (m.to_row, m.to_col))
+                    .collect();
+            }
+        }
+
+        let mut layout = BoardLayout::new();
+        let mut lines: Vec<String> = Vec::new();
+        lines.push(String::new()); // 顶部空行
+        lines.push(format!("{}    0   1   2   3   4   5   6   7   8{}", y, r));
+        lines.push(format!("{}  ┌───┬───┬───┬───┬───┬───┬───┬───┬───┐{}", y, r));
+
+        for i in 0..10 {
+            if i > 0 {
+                lines.push(format!(
+                    "{}  ├───┼───┼───┼───┼───┼───┼───┼───┼───┤{}",
+                    y, r
+                ));
+            }
+            let mut row_line = format!("{} {}│{}", y, i, r);
+            // 行号（" 0│"）占 3 个可见字符
+            let mut col: i32 = 3;
+            for j in 0..9 {
+                let piece = self.board.board[i][j];
+                let is_selected =
+                    selected.map_or(false, |(sr, sc)| sr == i as i32 && sc == j as i32);
+                let is_dest = dests
+                    .iter()
+                    .any(|&(dr, dc)| dr == i as i32 && dc == j as i32);
+                let (content, width): (String, i32) = if piece.is_empty() {
+                    if is_dest {
+                        // 可落点（空格子）：显示选中棋子的字，蓝色
+                        let ghost = selected
+                            .and_then(|(sr, sc)| {
+                                let p = self.board.get_piece(sr, sc);
+                                if p.is_empty() {
+                                    None
+                                } else {
+                                    Some(p.glyph().to_string())
+                                }
+                            })
+                            .unwrap_or_else(|| "  ".to_string());
+                        (format!("{}{}{}", blue, ghost, r), 1)
+                    } else {
+                        ("  ".to_string(), 2)
+                    }
+                } else if is_selected {
+                    // 选中棋子：紫色
+                    (format!("{}{}{}", magenta, piece.glyph(), r), 1)
+                } else if is_dest {
+                    // 可吃子：目标敌方棋子变蓝色
+                    (format!("{}{}{}", blue, piece.glyph(), r), 1)
+                } else {
+                    (piece.name(), 1)
+                };
+                layout.cells[i][j] = (col, width);
+                row_line.push_str(&content);
+                row_line.push_str(&format!(" {}│{}", y, r));
+                col += width + 2;
+            }
+            lines.push(row_line);
+            layout.rows[i] = (lines.len() - 1) as i32;
+            if i == 4 {
+                lines.push(format!(
+                    "{}  ├───┼───┼───┼───┼───┼───┼───┼───┼───┤{}",
+                    y, r
+                ));
+                lines.push(format!("{}  │    楚      河      汉      界     │{}", y, r));
+            }
+        }
+        lines.push(format!("{}  └───┴───┴───┴───┴───┴───┴───┴───┴───┘{}", y, r));
+
+        // 回合 / 将军警告 / 状态 / 操作提示
+        let is_ai = (self.current_player == PieceColor::Red && self.red_is_ai)
+            || (self.current_player == PieceColor::Black && self.black_is_ai);
+        let turn = if self.current_player == PieceColor::Red {
+            format!("{}{}回合{}", red, color_name(self.current_player), r)
+        } else {
+            format!("{}{}回合{}", gray, color_name(self.current_player), r)
+        };
+        let role = if is_ai {
+            format!("{}(AI回合){}", yellow, r)
+        } else {
+            format!("{}(玩家回合){}", green, r)
+        };
+        lines.push(format!("{cyan}┈ 当前:{r} {} {}", turn, role));
+        if self.board.is_in_check(self.current_player) {
+            lines.push(format!("{red}┈ 警告: 将军! 必须应将{r}"));
+        }
+        if !self.status.is_empty() {
+            lines.push(format!("{yellow}┈ {}{r}", self.status));
+        }
+        lines.push(format!(
+            "{cyan}┈ 左键: 选子/落子   右键: 取消选择   q: 退出   r: 重开{r}"
+        ));
+
+        let mut s = lines.join("\r\n");
+        s.push_str("\r\n");
+        (s, layout)
+    }
+
+    /// 执行走子：落子、记录日志、换手、终局判定，结果写入 status。返回是否成功。
+    fn commit_move_mouse(&mut self, mv: Move) -> bool {
+        let from_piece = self.board.get_piece(mv.from_row, mv.from_col);
+        let to_piece = self.board.get_piece(mv.to_row, mv.to_col);
+
+        if !self.board.make_move(&mv, self.current_player) {
+            self.status = "非法移动：该棋子不能这样走".to_string();
+            return false;
+        }
+
+        self.move_history.push(mv);
+        let mut move_str = format!(
+            "{}: {},{} -> {},{}",
+            color_name(self.current_player),
+            mv.from_row,
+            mv.from_col,
+            mv.to_row,
+            mv.to_col
+        );
+        if !to_piece.is_empty() {
+            move_str.push_str(&format!(" 吃{}", to_piece.name()));
+        } else {
+            move_str.push_str(&format!(" 移动{}", from_piece.name()));
+        }
+        if to_piece.ptype == PieceType::General && to_piece.color != self.current_player {
+            move_str.push_str(" [飞将!]");
+        }
+        self.game_log.push(move_str.clone());
+
+        self.current_player = opponent(self.current_player);
+        self.state = self.board.check_game_state(self.current_player);
+
+        if self.state == GameState::Playing {
+            self.status = move_str;
+        } else if self.state == GameState::Draw {
+            self.end_reason = self.board.draw_reason();
+            self.status = format!("{}（和棋：{}）", move_str, self.end_reason);
+        } else if self.state != GameState::Playing {
+            let target = self.board.get_piece(mv.to_row, mv.to_col);
+            if target.ptype == PieceType::General && target.color != self.current_player {
+                self.status = format!("{} 飞将成功！", move_str);
+            }
+            self.end_reason = self.board.win_reason(self.current_player);
+            if self.state == GameState::RedWin || self.state == GameState::BlackWin {
+                self.status = format!("{}  {}！", move_str, self.end_reason);
+            }
+        }
+        true
+    }
+
+    /// 鼠标模式主循环（菜单见 setup，与 legacy 一致）。
+    fn start_mouse(&mut self) {
+        let magenta = gamekit::color::MAGENTA;
+        let reset = gamekit::color::RESET;
+
+        self.setup();
+
+        let _mode = match MouseMode::enter() {
+            Ok(m) => m,
+            Err(_) => {
+                println!("无法启用鼠标模式，请使用 --legacy 参数运行");
+                return;
+            }
+        };
+        gamekit::hide_cursor();
+
+        let mut selected: Option<(i32, i32)> = None;
+
+        while self.state == GameState::Playing && !self.exited {
+            let is_ai = (self.current_player == PieceColor::Red && self.red_is_ai)
+                || (self.current_player == PieceColor::Black && self.black_is_ai);
+
+            // AI 回合：渲染“思考中”画面 -> 计算 -> 落子
+            if is_ai {
+                // 非阻塞检查 q（退出），避免 AI vs AI 时无法中断
+                let pending = gamekit::drain_keys();
+                if pending.q {
+                    self.exited = true;
+                    break;
+                }
+                self.status = format!("{}AI正在思考...", color_name(self.current_player));
+                let (board_str, _layout) = self.render_mouse(selected);
+                gamekit::clear_screen();
+                print!("{}", board_str);
+                use std::io::Write;
+                let _ = std::io::stdout().flush();
+
+                let ai_start = Instant::now();
+                let mut ai = AI::new(
+                    self.current_player,
+                    if self.current_player == PieceColor::Red {
+                        self.red_ai_difficulty
+                    } else {
+                        self.black_ai_difficulty
+                    },
+                );
+                let mv = ai.get_best_move(&mut self.board);
+                let ai_duration = ai_start.elapsed();
+
+                if mv.is_placeholder() {
+                    self.status = format!("{}没有找到合法移动！", color_name(self.current_player));
+                    self.state = if self.current_player == PieceColor::Red {
+                        GameState::BlackWin
+                    } else {
+                        GameState::RedWin
+                    };
+                    self.end_reason = format!("{}无着可走，判负", color_name(self.current_player));
+                    break;
+                }
+
+                let mut info = format!(
+                    "{}AI移动: ({},{}) -> ({},{}) [{}ms] [节点{}]",
+                    color_name(self.current_player),
+                    mv.from_row,
+                    mv.from_col,
+                    mv.to_row,
+                    mv.to_col,
+                    ai_duration.as_millis(),
+                    ai.get_nodes_evaluated()
+                );
+                if mv.score != 0 {
+                    info.push_str(&format!(" [评分: {}]", mv.score));
+                }
+                self.commit_move_mouse(mv);
+                if !self.status.starts_with("非法") {
+                    self.status = format!("{}  {}", info, self.status);
+                } else {
+                    self.status = info;
+                }
+                selected = None;
+                // 渲染一帧走子结果，让 AI 的着法可见
+                let (result_str, _layout) = self.render_mouse(selected);
+                gamekit::clear_screen();
+                print!("{}", result_str);
+                let _ = std::io::stdout().flush();
+                gamekit::sleep_ms(350);
+                continue;
+            }
+
+            // 玩家回合：渲染画面并读取鼠标/按键
+            let (board_str, layout) = self.render_mouse(selected);
+            gamekit::clear_screen();
+            print!("{}", board_str);
+            use std::io::Write;
+            let _ = std::io::stdout().flush();
+
+            match gamekit::read_key_or_mouse() {
+                None => {
+                    // 事件读取失败（无 TTY / EOF）：退出游戏
+                    self.exited = true;
+                }
+                Some(InputEvent::Key(KeyCode::Char('q'))) | Some(InputEvent::Key(KeyCode::Char('Q'))) => {
+                    self.exited = true;
+                }
+                Some(InputEvent::Key(KeyCode::Char('r'))) | Some(InputEvent::Key(KeyCode::Char('R'))) => {
+                    self.board.initialize_board();
+                    self.state = GameState::Playing;
+                    self.current_player = PieceColor::Red;
+                    self.game_log.clear();
+                    self.move_history.clear();
+                    self.end_reason.clear();
+                    self.status.clear();
+                    selected = None;
+                }
+                Some(InputEvent::Mouse(click)) => {
+                    if click.button == MouseButton::Right {
+                        selected = None;
+                        self.status.clear();
+                        continue;
+                    }
+                    if click.button != MouseButton::Left {
+                        continue;
+                    }
+                    let Some((r, c)) = layout.cell_at(click.column, click.row) else {
+                        continue;
+                    };
+                    let piece = self.board.get_piece(r, c);
+
+                    match selected {
+                        None => {
+                            if piece.color == self.current_player {
+                                selected = Some((r, c));
+                                self.status = format!(
+                                    "已选中 {}（{}），点击蓝色落点走子",
+                                    piece.name(),
+                                    color_name(self.current_player)
+                                );
+                            }
+                        }
+                        Some((sr, sc)) => {
+                            if piece.color == self.current_player {
+                                // 点击自己的棋子：切换选择；再点同一枚则取消
+                                if sr == r && sc == c {
+                                    selected = None;
+                                    self.status.clear();
+                                } else {
+                                    selected = Some((r, c));
+                                    self.status = format!(
+                                        "已切换到 {}（{}）",
+                                        piece.name(),
+                                        color_name(self.current_player)
+                                    );
+                                }
+                            } else if self.board.get_all_legal_moves(self.current_player).iter().any(
+                                |m| {
+                                    m.from_row == sr
+                                        && m.from_col == sc
+                                        && m.to_row == r
+                                        && m.to_col == c
+                                },
+                            ) {
+                                // 点击合法落点：走子
+                                self.commit_move_mouse(Move::from_pos(sr, sc, r, c));
+                                selected = None;
+                            } else {
+                                // 点到不可达位置：取消选择
+                                selected = None;
+                                self.status = "该位置不可达，已取消选择".to_string();
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // 游戏结束：显示最终棋盘与结果
+        let (board_str, _layout) = self.render_mouse(None);
+        gamekit::clear_screen();
+        print!("{}", board_str);
+        println!("{}\n游戏结束！{}", magenta, reset);
+        if !self.end_reason.is_empty() {
+            println!("结束原因: {}", self.end_reason);
+        }
+        match self.state {
+            GameState::RedWin => println!("红方获胜！"),
+            GameState::BlackWin => println!("黑方获胜！"),
+            GameState::Draw => println!("和棋！"),
+            _ => {}
+        }
+        println!("\n游戏日志（共{}步）:", self.game_log.len());
+        for (i, entry) in self.game_log.iter().enumerate() {
+            println!("{}. {}", i + 1, entry);
+        }
     }
 
     fn get_player_move(&self) -> Move {
@@ -3254,8 +3681,13 @@ fn read_int(max: i32) -> Option<i32> {
 
 fn main() {
     gamekit::init();
+    let legacy = std::env::args().any(|a| a == "--legacy");
     let mut game = Game::new();
-    game.start();
+    if legacy {
+        game.start();
+    } else {
+        game.start_mouse();
+    }
 
     println!(
         "{}\n感谢游玩中国象棋增强AI版！{}",
@@ -3616,6 +4048,39 @@ mod tests {
             mv.to_col
         );
     }
+
+    /// 鼠标模式：棋盘布局与点击坐标映射必须双向一致
+    #[test]
+    fn mouse_layout_round_trip() {
+        for selected in [None, Some((9, 4)), Some((0, 4)), Some((4, 7))] {
+            let game = Game::new();
+            let (board_str, layout) = game.render_mouse(selected);
+            assert!(!board_str.is_empty());
+            for i in 0..10 {
+                for j in 0..9 {
+                    let (start, width) = layout.cells[i][j];
+                    // 格子中心列与内容行（均 0 基，与 crossterm 鼠标坐标一致）
+                    let col = (start + width / 2) as u16;
+                    let row = layout.rows[i] as u16;
+                    assert_eq!(
+                        layout.cell_at(col, row),
+                        Some((i as i32, j as i32)),
+                        "selected={selected:?} cell ({i},{j})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// 鼠标模式：选中棋子呈紫色、可落点呈蓝色；未选中时无紫色
+    #[test]
+    fn mouse_render_highlights_selection() {
+        let game = Game::new();
+        let (board_str, _) = game.render_mouse(Some((9, 4))); // 选中红帅
+        assert!(board_str.contains("\x1b[95m"), "选中棋子应为紫色");
+        assert!(board_str.contains("\x1b[94m"), "可落点应为蓝色");
+
+        let (board_str2, _) = game.render_mouse(None);
+        assert!(!board_str2.contains("\x1b[95m"), "未选中时不应出现紫色");
+    }
 }
-
-
