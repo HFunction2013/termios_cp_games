@@ -2629,8 +2629,8 @@ impl AI {
 // ---------------------------------------------------------------------------
 
 /// 鼠标模式下棋盘的屏幕布局：记录每行棋盘内容所在屏幕行（0 基）、
-/// 每个格子内容起止列（0 基，含内容后的一个空格，不含格线），
-/// 用于把终端点击坐标映射回棋盘格。
+/// 每个格子内容的起始列与宽度（0 基，含内容后的一个空格，不含格线）。
+/// 每个格子固定 4 列：第 j 列格子内容起始列为 3+4j，内容占 2 列。
 struct BoardLayout {
     rows: [i32; 10],
     cells: [[(i32, i32); 9]; 10],
@@ -3138,7 +3138,8 @@ impl Game {
                 ));
             }
             let mut row_line = format!("{} {}│{}", y, i, r);
-            // 行号（" 0│"）占 3 个可见字符
+            // 行号（" 0│"）占 3 个可见字符；每个格子固定占 4 列：
+            // 棋子字（CJK 双宽，2 列）或两个空格（2 列）+ " │"（2 列）
             let mut col: i32 = 3;
             for j in 0..9 {
                 let piece = self.board.board[i][j];
@@ -3147,7 +3148,7 @@ impl Game {
                 let is_dest = dests
                     .iter()
                     .any(|&(dr, dc)| dr == i as i32 && dc == j as i32);
-                let (content, width): (String, i32) = if piece.is_empty() {
+                let content: String = if piece.is_empty() {
                     if is_dest {
                         // 可落点（空格子）：显示选中棋子的字，蓝色
                         let ghost = selected
@@ -3160,23 +3161,24 @@ impl Game {
                                 }
                             })
                             .unwrap_or_else(|| "  ".to_string());
-                        (format!("{}{}{}", blue, ghost, r), 1)
+                        format!("{}{}{}", blue, ghost, r)
                     } else {
-                        ("  ".to_string(), 2)
+                        "  ".to_string()
                     }
                 } else if is_selected {
                     // 选中棋子：紫色
-                    (format!("{}{}{}", magenta, piece.glyph(), r), 1)
+                    format!("{}{}{}", magenta, piece.glyph(), r)
                 } else if is_dest {
                     // 可吃子：目标敌方棋子变蓝色
-                    (format!("{}{}{}", blue, piece.glyph(), r), 1)
+                    format!("{}{}{}", blue, piece.glyph(), r)
                 } else {
-                    (piece.name(), 1)
+                    piece.name()
                 };
-                layout.cells[i][j] = (col, width);
+                // 内容恒为 2 个终端列宽（棋子为双宽字）
+                layout.cells[i][j] = (col, 2);
                 row_line.push_str(&content);
                 row_line.push_str(&format!(" {}│{}", y, r));
-                col += width + 2;
+                col += 4;
             }
             lines.push(row_line);
             layout.rows[i] = (lines.len() - 1) as i32;
@@ -3211,7 +3213,7 @@ impl Game {
             lines.push(format!("{yellow}┈ {}{r}", self.status));
         }
         lines.push(format!(
-            "{cyan}┈ 左键: 选子/落子   右键: 取消选择   q: 退出   r: 重开{r}"
+            "{cyan}┈ 左键: 选子/落子   右键/Esc: 取消选择   q: 退出   r: 重开{r}"
         ));
 
         let mut s = lines.join("\r\n");
@@ -3271,11 +3273,10 @@ impl Game {
 
     /// 鼠标模式主循环（菜单见 setup，与 legacy 一致）。
     fn start_mouse(&mut self) {
-        let magenta = gamekit::color::MAGENTA;
-        let reset = gamekit::color::RESET;
-
         self.setup();
 
+        // 鼠标模式作用域：结束后先恢复终端，再以正常模式输出结果与日志
+        {
         let _mode = match MouseMode::enter() {
             Ok(m) => m,
             Err(_) => {
@@ -3383,6 +3384,11 @@ impl Game {
                     self.status.clear();
                     selected = None;
                 }
+                Some(InputEvent::Key(KeyCode::Esc)) | Some(InputEvent::Key(KeyCode::Backspace)) => {
+                    // 键盘取消选择（部分终端右键被系统菜单截获）
+                    selected = None;
+                    self.status.clear();
+                }
                 Some(InputEvent::Mouse(click)) => {
                     if click.button == MouseButton::Right {
                         selected = None;
@@ -3445,10 +3451,12 @@ impl Game {
             }
         }
 
-        // 游戏结束：显示最终棋盘与结果
-        let (board_str, _layout) = self.render_mouse(None);
-        gamekit::clear_screen();
-        print!("{}", board_str);
+        } // 鼠标模式作用域结束：MouseMode 恢复终端
+
+        // 游戏结束：以正常终端模式显示最终棋盘与结果（与 legacy 一致）
+        let magenta = gamekit::color::MAGENTA;
+        let reset = gamekit::color::RESET;
+        self.board.display();
         println!("{}\n游戏结束！{}", magenta, reset);
         if !self.end_reason.is_empty() {
             println!("结束原因: {}", self.end_reason);
@@ -3463,6 +3471,13 @@ impl Game {
         for (i, entry) in self.game_log.iter().enumerate() {
             println!("{}. {}", i + 1, entry);
         }
+        println!("{}\n游戏统计:{}", gamekit::color::CYAN, reset);
+        println!("总步数: {}", self.game_log.len());
+        println!("当前局面重复次数: {}", self.board.get_repetition_count());
+        println!(
+            "50回合规则计数器: {} / 100 步",
+            self.board.get_fifty_move_counter()
+        );
     }
 
     fn get_player_move(&self) -> Move {
@@ -4058,6 +4073,12 @@ mod tests {
             assert!(!board_str.is_empty());
             for i in 0..10 {
                 for j in 0..9 {
+                    // 每格固定 4 列：内容起始列 3+4j、宽 2（棋子为双宽 CJK 字）
+                    assert_eq!(
+                        layout.cells[i][j],
+                        (3 + 4 * j as i32, 2),
+                        "selected={selected:?} cell({i},{j}) geometry"
+                    );
                     let (start, width) = layout.cells[i][j];
                     // 格子中心列与内容行（均 0 基，与 crossterm 鼠标坐标一致）
                     let col = (start + width / 2) as u16;

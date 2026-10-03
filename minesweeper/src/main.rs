@@ -396,11 +396,18 @@ impl Game {
                 };
                 gamekit::hide_cursor();
 
+                // 标记模式：部分终端右键被系统菜单截获，按 f 切换后用左键标记
+                let mut flag_mode = false;
+
                 // 游戏主循环（鼠标）
                 while self.alive && self.m > (N * k) as i32 {
                     gamekit::clear_screen();
                     print!("{}", self.board_string(false));
-                    print!("左键:翻开  右键:标记/取消   q:退出\r\n");
+                    if flag_mode {
+                        print!("【标记模式】左键:标记/取消标记   f:退出标记模式   q:退出\r\n");
+                    } else {
+                        print!("左键:翻开   f:标记模式  右键:标记/取消   q:退出\r\n");
+                    }
 
                     match gamekit::read_key_or_mouse() {
                         None => {
@@ -412,19 +419,31 @@ impl Game {
                             quit = true;
                             break;
                         }
+                        Some(InputEvent::Key(KeyCode::Char(c))) if c == 'f' || c == 'F' => {
+                            flag_mode = !flag_mode;
+                        }
                         Some(InputEvent::Mouse(click)) => {
                             let Some((i, j)) = cell_from_click(click.column, click.row) else {
                                 continue;
                             };
                             match click.button {
                                 MouseButton::Left => {
-                                    // 左键：翻开格子（已翻开或已标记的格子不响应）
-                                    if self.b[i][j] == b' ' {
-                                        self.m -= self.reveal(i, j);
+                                    if flag_mode {
+                                        // 标记模式：左键标记 / 取消标记
+                                        if self.b[i][j] == b' ' {
+                                            self.b[i][j] = b'P';
+                                        } else if self.b[i][j] == b'P' {
+                                            self.b[i][j] = b' ';
+                                        }
+                                    } else {
+                                        // 左键：翻开格子（已翻开或已标记的格子不响应）
+                                        if self.b[i][j] == b' ' {
+                                            self.m -= self.reveal(i, j);
+                                        }
                                     }
                                 }
                                 MouseButton::Right => {
-                                    // 右键：标记 / 取消标记
+                                    // 右键：标记 / 取消标记（支持右键的终端可用）
                                     if self.b[i][j] == b' ' {
                                         self.b[i][j] = b'P';
                                     } else if self.b[i][j] == b'P' {
@@ -443,9 +462,9 @@ impl Game {
                 print!("{}", self.board_string(true));
                 if !quit {
                     if self.alive {
-                        println!("恭喜！你赢了！点击或按任意键开始下一局");
+                        print!("恭喜！你赢了！点击或按任意键开始下一局\r\n");
                     } else {
-                        println!("踩到地雷了！点击或按任意键结束");
+                        print!("踩到地雷了！点击或按任意键结束\r\n");
                     }
                     let _ = gamekit::read_key_or_mouse();
                 }
