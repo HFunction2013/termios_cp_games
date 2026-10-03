@@ -6,12 +6,8 @@
 //! 玩法与原版一致：
 //! - 模式：玩家VS玩家 / 玩家VS AI / AI VS AI
 //! - 输入格式：行 列 行 列（如 9 4 7 4），特殊命令 99 X
-//! - AI 包含 Alpha-Beta 剪枝、启发式移动排序、静态交换评估（Quiescence）、
+//! - AI 包含 Alpha-Beta 剪枝、启发式移动排序、静态交换评估（SEE/Quiescence）、
 //!   迭代深化、时间限制搜索、Zobrist 局面哈希与重复检测
-//!
-//! 与原版的一处行为差异：原版用 std::set 统计重复局面（恒为 1，三次重复
-//! 判和永远不触发），本移植改为用计数器统计，使“三次重复局面判和”规则
-//! 真正生效，与代码注释的设计意图一致。
 
 use gamekit;
 use std::collections::HashMap;
@@ -61,6 +57,39 @@ enum GamePhase {
     Opening,
     Midgame,
     Endgame,
+}
+
+/// 循环着法（长将 / 长捉）的定性结果
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PerpetualKind {
+    None,
+    Check, // 长将
+    Chase, // 长捉
+}
+
+impl PerpetualKind {
+    fn name(self) -> &'static str {
+        match self {
+            PerpetualKind::None => "无",
+            PerpetualKind::Check => "长将",
+            PerpetualKind::Chase => "长捉",
+        }
+    }
+}
+
+fn opponent(c: PieceColor) -> PieceColor {
+    match c {
+        PieceColor::Red => PieceColor::Black,
+        _ => PieceColor::Red,
+    }
+}
+
+fn color_name(c: PieceColor) -> &'static str {
+    if c == PieceColor::Red {
+        "红方"
+    } else {
+        "黑方"
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -232,7 +261,11 @@ impl Piece {
 
     /// Zobrist 棋子索引（红 0~6，黑 7~13）
     fn piece_index(&self) -> usize {
-        let color_offset = if self.color == PieceColor::Red { 0 } else { 7 };
+        let color_offset = if self.color == PieceColor::Red {
+            0
+        } else {
+            7
+        };
         let type_index = match self.ptype {
             PieceType::General => 0,
             PieceType::Advisor => 1,
@@ -285,16 +318,522 @@ static ZOBRIST: std::sync::LazyLock<ZobristData> = std::sync::LazyLock::new(|| {
 });
 
 // ---------------------------------------------------------------------------
+// 棋盘基础工具（自由函数，便于在不克隆 Board 的前提下做快速试算）
+// ---------------------------------------------------------------------------
+
+type Grid = [[Piece; 9]; 10];
+
+const DIRS4: [(i32, i32); 4] = [(1, 0), (-1, 0), (0, 1), (0, -1)];
+const DIAG4: [(i32, i32); 4] = [(1, 1), (1, -1), (-1, 1), (-1, -1)];
+const HORSE_DELTAS: [(i32, i32); 8] = [
+    (2, 1),
+    (2, -1),
+    (-2, 1),
+    (-2, -1),
+    (1, 2),
+    (1, -2),
+    (-1, 2),
+    (-1, -2),
+];
+const ELEPHANT_DELTAS: [(i32, i32); 4] = [(2, 2), (2, -2), (-2, 2), (-2, -2)];
+
+fn g_in_board(r: i32, c: i32) -> bool {
+    r >= 0 && r < 10 && c >= 0 && c < 9
+}
+
+fn g_get(a: &Grid, r: i32, c: i32) -> Piece {
+    if g_in_board(r, c) {
+        a[r as usize][c as usize]
+    } else {
+        Piece::new()
+    }
+}
+
+fn g_set(a: &mut Grid, r: i32, c: i32, p: Piece) {
+    if g_in_board(r, c) {
+        a[r as usize][c as usize] = p;
+    }
+}
+
+/// 在九宫格内？
+fn in_palace(r: i32, c: i32, color: PieceColor) -> bool {
+    if c < 3 || c > 5 {
+        return false;
+    }
+    if color == PieceColor::Red {
+        (7..=9).contains(&r)
+    } else {
+        (0..=2).contains(&r)
+    }
+}
+
+fn general_legal(a: &Grid, fr: i32, fc: i32, tr: i32, tc: i32, color: PieceColor) -> bool {
+    let to = g_get(a, tr, tc);
+
+    // “飞将”：将帅照面，可直接吃掉对方将/帅
+    if to.ptype == PieceType::General && to.color != color {
+        if fc != tc {
+            return false;
+        }
+        let start = fr.min(tr) + 1;
+        let end = fr.max(tr);
+        for r in start..end {
+            if !g_get(a, r, fc).is_empty() {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // 九宫格限制
+    if !in_palace(tr, tc, color) {
+        return false;
+    }
+    let dr = (tr - fr).abs();
+    let dc = (tc - fc).abs();
+    (dr == 1 && dc == 0) || (dr == 0 && dc == 1)
+}
+
+fn advisor_legal(a: &Grid, fr: i32, fc: i32, tr: i32, tc: i32, color: PieceColor) -> bool {
+    let _ = a;
+    let _ = (fr, fc);
+    if !in_palace(tr, tc, color) {
+        return false;
+    }
+    let dr = (tr - fr).abs();
+    let dc = (tc - fc).abs();
+    dr == 1 && dc == 1
+}
+
+fn elephant_legal(a: &Grid, fr: i32, fc: i32, tr: i32, tc: i32, color: PieceColor) -> bool {
+    // 象/相不能过河
+    if color == PieceColor::Red && tr < 5 {
+        return false;
+    }
+    if color == PieceColor::Black && tr > 4 {
+        return false;
+    }
+    let dr = (tr - fr).abs();
+    let dc = (tc - fc).abs();
+    if dr != 2 || dc != 2 {
+        return false;
+    }
+    // 蹩象眼
+    let mr = (fr + tr) / 2;
+    let mc = (fc + tc) / 2;
+    g_get(a, mr, mc).is_empty()
+}
+
+fn horse_legal(a: &Grid, fr: i32, fc: i32, tr: i32, tc: i32) -> bool {
+    let dr = (tr - fr).abs();
+    let dc = (tc - fc).abs();
+    if !((dr == 2 && dc == 1) || (dr == 1 && dc == 2)) {
+        return false;
+    }
+    // 蹩马腿
+    if dr == 2 {
+        let mr = (fr + tr) / 2;
+        if !g_get(a, mr, fc).is_empty() {
+            return false;
+        }
+    } else {
+        let mc = (fc + tc) / 2;
+        if !g_get(a, fr, mc).is_empty() {
+            return false;
+        }
+    }
+    true
+}
+
+fn chariot_legal(a: &Grid, fr: i32, fc: i32, tr: i32, tc: i32) -> bool {
+    if fr != tr && fc != tc {
+        return false;
+    }
+    if fr == tr {
+        let start = fc.min(tc) + 1;
+        let end = fc.max(tc);
+        for c in start..end {
+            if !g_get(a, fr, c).is_empty() {
+                return false;
+            }
+        }
+    } else {
+        let start = fr.min(tr) + 1;
+        let end = fr.max(tr);
+        for r in start..end {
+            if !g_get(a, r, fc).is_empty() {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn cannon_legal(a: &Grid, fr: i32, fc: i32, tr: i32, tc: i32) -> bool {
+    if fr != tr && fc != tc {
+        return false;
+    }
+    let to = g_get(a, tr, tc);
+    let mut between = 0;
+    if fr == tr {
+        let start = fc.min(tc) + 1;
+        let end = fc.max(tc);
+        for c in start..end {
+            if !g_get(a, fr, c).is_empty() {
+                between += 1;
+            }
+        }
+    } else {
+        let start = fr.min(tr) + 1;
+        let end = fr.max(tr);
+        for r in start..end {
+            if !g_get(a, r, fc).is_empty() {
+                between += 1;
+            }
+        }
+    }
+    if to.is_empty() {
+        between == 0
+    } else {
+        between == 1
+    }
+}
+
+/// 兵/卒是否已过河
+fn soldier_crossed(r: i32, color: PieceColor) -> bool {
+    (color == PieceColor::Red && r <= 4) || (color == PieceColor::Black && r >= 5)
+}
+
+fn soldier_legal(a: &Grid, fr: i32, fc: i32, tr: i32, tc: i32, color: PieceColor) -> bool {
+    let _ = a;
+    let dr = tr - fr;
+    let dc = (tc - fc).abs();
+
+    if color == PieceColor::Red && dr > 0 {
+        return false; // 红兵只能向上（行号减小）
+    }
+    if color == PieceColor::Black && dr < 0 {
+        return false; // 黑卒只能向下（行号增大）
+    }
+
+    if soldier_crossed(fr, color) {
+        (dr.abs() == 1 && dc == 0) || (dr.abs() == 0 && dc == 1)
+    } else {
+        dr.abs() == 1 && dc == 0
+    }
+}
+
+/// 走子是否符合棋子本身的走法（不做“走后是否被将军”的检查）
+fn move_legal(a: &Grid, fr: i32, fc: i32, tr: i32, tc: i32) -> bool {
+    let from = g_get(a, fr, fc);
+    if from.is_empty() {
+        return false;
+    }
+    let to = g_get(a, tr, tc);
+    if !to.is_empty() && to.color == from.color {
+        return false;
+    }
+    match from.ptype {
+        PieceType::General => general_legal(a, fr, fc, tr, tc, from.color),
+        PieceType::Advisor => advisor_legal(a, fr, fc, tr, tc, from.color),
+        PieceType::Elephant => elephant_legal(a, fr, fc, tr, tc, from.color),
+        PieceType::Horse => horse_legal(a, fr, fc, tr, tc),
+        PieceType::Chariot => chariot_legal(a, fr, fc, tr, tc),
+        PieceType::Cannon => cannon_legal(a, fr, fc, tr, tc),
+        PieceType::Soldier => soldier_legal(a, fr, fc, tr, tc, from.color),
+        _ => false,
+    }
+}
+
+fn find_general(a: &Grid, color: PieceColor) -> Option<(i32, i32)> {
+    for r in 0..10i32 {
+        for c in 0..9i32 {
+            let p = g_get(a, r, c);
+            if p.ptype == PieceType::General && p.color == color {
+                return Some((r, c));
+            }
+        }
+    }
+    None
+}
+
+fn has_general(a: &Grid, color: PieceColor) -> bool {
+    find_general(a, color).is_some()
+}
+
+/// (row, col) 是否被 attacker 方攻击（含“飞将”照面）
+fn square_attacked(a: &Grid, row: i32, col: i32, attacker: PieceColor) -> bool {
+    // 车 / 炮：沿四个方向扫描，第一个子挡车、第二个子后才能被炮打
+    for (dr, dc) in DIRS4 {
+        let mut r = row + dr;
+        let mut c = col + dc;
+        let mut screen = false;
+        while g_in_board(r, c) {
+            let p = g_get(a, r, c);
+            if !p.is_empty() {
+                if p.color == attacker {
+                    if !screen && p.ptype == PieceType::Chariot {
+                        return true;
+                    }
+                    if screen && p.ptype == PieceType::Cannon {
+                        return true;
+                    }
+                }
+                if screen {
+                    break; // 第二个子之后不再扫描
+                }
+                screen = true;
+            }
+            r += dr;
+            c += dc;
+        }
+    }
+
+    // 马
+    for (dr, dc) in HORSE_DELTAS {
+        let r = row + dr;
+        let c = col + dc;
+        if !g_in_board(r, c) {
+            continue;
+        }
+        let p = g_get(a, r, c);
+        if p.color == attacker && p.ptype == PieceType::Horse && horse_legal(a, r, c, row, col) {
+            return true;
+        }
+    }
+
+    // 兵 / 卒
+    for (dr, dc) in DIRS4 {
+        let r = row + dr;
+        let c = col + dc;
+        if !g_in_board(r, c) {
+            continue;
+        }
+        let p = g_get(a, r, c);
+        if p.color == attacker
+            && p.ptype == PieceType::Soldier
+            && soldier_legal(a, r, c, row, col, attacker)
+        {
+            return true;
+        }
+    }
+
+    // 将 / 帅（一步）
+    for (dr, dc) in DIRS4 {
+        let r = row + dr;
+        let c = col + dc;
+        if !g_in_board(r, c) {
+            continue;
+        }
+        let p = g_get(a, r, c);
+        if p.color == attacker
+            && p.ptype == PieceType::General
+            && general_legal(a, r, c, row, col, attacker)
+        {
+            return true;
+        }
+    }
+
+    // 士 / 仕
+    for (dr, dc) in DIAG4 {
+        let r = row + dr;
+        let c = col + dc;
+        if !g_in_board(r, c) {
+            continue;
+        }
+        let p = g_get(a, r, c);
+        if p.color == attacker
+            && p.ptype == PieceType::Advisor
+            && advisor_legal(a, r, c, row, col, attacker)
+        {
+            return true;
+        }
+    }
+
+    // 象 / 相
+    for (dr, dc) in ELEPHANT_DELTAS {
+        let r = row + dr;
+        let c = col + dc;
+        if !g_in_board(r, c) {
+            continue;
+        }
+        let p = g_get(a, r, c);
+        if p.color == attacker
+            && p.ptype == PieceType::Elephant
+            && elephant_legal(a, r, c, row, col, attacker)
+        {
+            return true;
+        }
+    }
+
+    // 飞将：目标格上是对方的将/帅，且攻击方将/帅与其同列、中间无子
+    let target = g_get(a, row, col);
+    if target.ptype == PieceType::General && target.color != attacker {
+        if let Some((ar, ac)) = find_general(a, attacker) {
+            if ac == col {
+                let start = row.min(ar) + 1;
+                let end = row.max(ar);
+                let mut clear = true;
+                for r in start..end {
+                    if !g_get(a, r, col).is_empty() {
+                        clear = false;
+                        break;
+                    }
+                }
+                if clear {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
+}
+
+/// (row, col) 是否被 defender 方的其它棋子保护
+fn square_protected(a: &Grid, row: i32, col: i32, defender: PieceColor) -> bool {
+    for r in 0..10i32 {
+        for c in 0..9i32 {
+            if r == row && c == col {
+                continue;
+            }
+            let p = g_get(a, r, c);
+            if p.is_empty() || p.color != defender {
+                continue;
+            }
+            if move_legal(a, r, c, row, col) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn in_check(a: &Grid, color: PieceColor) -> bool {
+    match find_general(a, color) {
+        Some((r, c)) => square_attacked(a, r, c, opponent(color)),
+        None => false,
+    }
+}
+
+/// 找出能走到 (row, col) 的、价值最低的 by 方棋子（SEE 用）
+fn least_valuable_attacker(a: &Grid, row: i32, col: i32, by: PieceColor) -> Option<(i32, i32)> {
+    let mut best: Option<(i32, i32, i32)> = None;
+    for r in 0..10i32 {
+        for c in 0..9i32 {
+            if r == row && c == col {
+                continue;
+            }
+            let p = g_get(a, r, c);
+            if p.is_empty() || p.color != by {
+                continue;
+            }
+            if !move_legal(a, r, c, row, col) {
+                continue;
+            }
+            let v = p.value();
+            if best.map_or(true, |(bv, _, _)| v < bv) {
+                best = Some((v, r, c));
+            }
+        }
+    }
+    best.map(|(_, r, c)| (r, c))
+}
+
+/// 静态交换评估：side 主动在 (row, col) 上发动吃子序列的最大净收益（可选不吃 → 0）
+fn see_capture(a: &mut Grid, row: i32, col: i32, side: PieceColor) -> i32 {
+    let (ar, ac) = match least_valuable_attacker(a, row, col, side) {
+        Some(x) => x,
+        None => return 0,
+    };
+    let attacker = g_get(a, ar, ac);
+    let captured = g_get(a, row, col);
+    let cap_val = if captured.is_empty() {
+        0
+    } else {
+        captured.value()
+    };
+
+    g_set(a, row, col, attacker);
+    g_set(a, ar, ac, Piece::new());
+
+    let gain = cap_val - see_capture(a, row, col, opponent(side));
+
+    g_set(a, ar, ac, attacker);
+    g_set(a, row, col, captured);
+
+    if gain > 0 {
+        gain
+    } else {
+        0
+    }
+}
+
+/// 走某一步之后的静态交换评估（可为负：代表这步会白丢子）
+fn see_move(a: &Grid, mv: &Move, color: PieceColor) -> i32 {
+    let mut scratch = *a;
+    let mover = g_get(&scratch, mv.from_row, mv.from_col);
+    let captured = g_get(&scratch, mv.to_row, mv.to_col);
+    if mover.is_empty() {
+        return 0;
+    }
+    g_set(&mut scratch, mv.to_row, mv.to_col, mover);
+    g_set(&mut scratch, mv.from_row, mv.from_col, Piece::new());
+    let gain = if captured.is_empty() {
+        0
+    } else {
+        captured.value()
+    };
+    gain - see_capture(&mut scratch, mv.to_row, mv.to_col, opponent(color))
+}
+
+// ---------------------------------------------------------------------------
+// 历史条目（用于长将 / 长捉 / 重复局面判定）
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy)]
+struct HistoryEntry {
+    #[allow(dead_code)]
+    mv: Move,
+    mover: PieceColor,
+    #[allow(dead_code)]
+    moved: Piece,
+    #[allow(dead_code)]
+    captured: Piece,
+    /// 走完这步后，对方是否被将军
+    gave_check: bool,
+    /// 走完这步后，是否“捉”（威胁吃掉对方无保护或高价值棋子）
+    chasing: bool,
+    /// 不可逆着法（吃子或兵卒移动）
+    irreversible: bool,
+    /// 走完这步后的局面哈希
+    #[allow(dead_code)]
+    hash: u64,
+}
+
+// ---------------------------------------------------------------------------
 // 棋盘
 // ---------------------------------------------------------------------------
 
 #[derive(Clone)]
 struct Board {
-    board: [[Piece; 9]; 10],
+    board: Grid,
     zobrist_hash: u64,
     position_history: HashMap<u64, u32>,
     fifty_move_rule_counter: i32,
     repetition_count: i32,
+    /// 着法历史（含将军/捉子标记），用于循环着法判定
+    history: Vec<HistoryEntry>,
+    /// 局面哈希序列，hash_history[i] = 走了 i 步之后的哈希
+    hash_history: Vec<u64>,
+}
+
+/// make/unmake 用的回滚信息（不触碰历史与计数器）
+#[derive(Clone, Copy)]
+struct Undo {
+    captured: Piece,
+    hash: u64,
+    fifty: i32,
 }
 
 impl Board {
@@ -305,6 +844,8 @@ impl Board {
             position_history: HashMap::new(),
             fifty_move_rule_counter: 0,
             repetition_count: 0,
+            history: Vec::new(),
+            hash_history: Vec::new(),
         };
         b.initialize_board();
         b
@@ -361,7 +902,6 @@ impl Board {
 
         self.zobrist_hash = self.compute_zobrist_hash();
         self.reset_position_history();
-        self.record_position();
     }
 
     fn compute_zobrist_hash(&self) -> u64 {
@@ -369,7 +909,7 @@ impl Board {
         for row in 0..10 {
             for col in 0..9 {
                 let piece = self.board[row][col];
-                if piece.ptype != PieceType::Empty && piece.color != PieceColor::None {
+                if !piece.is_empty() {
                     hash ^= ZOBRIST.table[row * 9 + col][piece.piece_index()];
                 }
             }
@@ -377,38 +917,67 @@ impl Board {
         hash
     }
 
-    fn update_zobrist_hash(&mut self, from_row: i32, from_col: i32, to_row: i32, to_col: i32, captured: Piece) {
-        let from_piece = self.get_piece(from_row, from_col);
-        let from_index = from_row as usize * 9 + from_col as usize;
-        self.zobrist_hash ^= ZOBRIST.table[from_index][from_piece.piece_index()];
+    /// 只更新棋盘与哈希，不动历史/计数器（搜索与着法生成用）
+    fn apply_move(&mut self, mv: &Move) -> Undo {
+        let from_piece = g_get(&self.board, mv.from_row, mv.from_col);
+        let captured = g_get(&self.board, mv.to_row, mv.to_col);
+        let undo = Undo {
+            captured,
+            hash: self.zobrist_hash,
+            fifty: self.fifty_move_rule_counter,
+        };
 
-        if captured.ptype != PieceType::Empty {
-            let captured_index = to_row as usize * 9 + to_col as usize;
-            self.zobrist_hash ^= ZOBRIST.table[captured_index][captured.piece_index()];
+        self.zobrist_hash ^= ZOBRIST.table[(mv.from_row * 9 + mv.from_col) as usize]
+            [from_piece.piece_index()];
+        if !captured.is_empty() {
+            self.zobrist_hash ^= ZOBRIST.table[(mv.to_row * 9 + mv.to_col) as usize]
+                [captured.piece_index()];
         }
-
-        let to_index = to_row as usize * 9 + to_col as usize;
-        self.zobrist_hash ^= ZOBRIST.table[to_index][from_piece.piece_index()];
+        self.zobrist_hash ^=
+            ZOBRIST.table[(mv.to_row * 9 + mv.to_col) as usize][from_piece.piece_index()];
         self.zobrist_hash ^= ZOBRIST.side;
+
+        g_set(&mut self.board, mv.to_row, mv.to_col, from_piece);
+        g_set(&mut self.board, mv.from_row, mv.from_col, Piece::new());
+        undo
+    }
+
+    fn undo_move(&mut self, mv: &Move, undo: &Undo) {
+        let from_piece = g_get(&self.board, mv.to_row, mv.to_col);
+        g_set(&mut self.board, mv.from_row, mv.from_col, from_piece);
+        g_set(&mut self.board, mv.to_row, mv.to_col, undo.captured);
+        self.zobrist_hash = undo.hash;
+        self.fifty_move_rule_counter = undo.fifty;
     }
 
     fn record_position(&mut self) {
-        *self.position_history.entry(self.zobrist_hash).or_insert(0) += 1;
-        self.repetition_count = *self.position_history.get(&self.zobrist_hash).unwrap_or(&0) as i32;
+        self.hash_history.push(self.zobrist_hash);
+        let counter = self.position_history.entry(self.zobrist_hash).or_insert(0);
+        *counter += 1;
+        self.repetition_count = *counter as i32;
+    }
+
+    /// 清空重复局面记录（不可逆着法之后调用：此前的局面不可能再重现）
+    fn clear_position_history(&mut self) {
+        self.position_history.clear();
+        self.hash_history.clear();
+        self.repetition_count = 0;
     }
 
     fn is_threefold_repetition(&self) -> bool {
         self.repetition_count >= 3
     }
 
+    /// 50 回合规则：连续 100 个半回合（=50 回合）无吃子且无兵卒移动
     fn is_fifty_move_rule_draw(&self) -> bool {
         self.fifty_move_rule_counter >= 100
     }
 
     fn reset_position_history(&mut self) {
-        self.position_history.clear();
+        self.clear_position_history();
         self.fifty_move_rule_counter = 0;
-        self.repetition_count = 0;
+        self.history.clear();
+        self.record_position();
     }
 
     #[allow(dead_code)]
@@ -425,403 +994,398 @@ impl Board {
     }
 
     fn get_piece(&self, row: i32, col: i32) -> Piece {
-        if row >= 0 && row < 10 && col >= 0 && col < 9 {
-            self.board[row as usize][col as usize]
-        } else {
-            Piece::new()
-        }
+        g_get(&self.board, row, col)
     }
 
+    #[allow(dead_code)]
     fn set_piece(&mut self, row: i32, col: i32, piece: Piece) {
-        if row >= 0 && row < 10 && col >= 0 && col < 9 {
-            self.board[row as usize][col as usize] = piece;
-        }
+        g_set(&mut self.board, row, col, piece);
     }
 
     fn is_valid_position(&self, row: i32, col: i32) -> bool {
-        row >= 0 && row < 10 && col >= 0 && col < 9
+        g_in_board(row, col)
     }
 
-    fn move_piece(&mut self, mv: &Move, current_player: PieceColor) -> bool {
-        let from_row = mv.from_row;
-        let from_col = mv.from_col;
-        let to_row = mv.to_row;
-        let to_col = mv.to_col;
+    fn has_general(&self, color: PieceColor) -> bool {
+        has_general(&self.board, color)
+    }
 
-        if !self.is_valid_position(from_row, from_col) || !self.is_valid_position(to_row, to_col) {
+    /// 只检查“棋子走法 + 归属”，不检查走后是否被将军
+    fn is_pseudo_legal(&self, mv: &Move, color: PieceColor) -> bool {
+        if !self.is_valid_position(mv.from_row, mv.from_col)
+            || !self.is_valid_position(mv.to_row, mv.to_col)
+        {
+            return false;
+        }
+        if mv.from_row == mv.to_row && mv.from_col == mv.to_col {
+            return false;
+        }
+        let from = self.get_piece(mv.from_row, mv.from_col);
+        let to = self.get_piece(mv.to_row, mv.to_col);
+        if from.is_empty() || from.color != color {
+            return false;
+        }
+        if !to.is_empty() && to.color == color {
+            return false;
+        }
+        self.is_move_legal(mv.from_row, mv.from_col, mv.to_row, mv.to_col)
+    }
+
+    /// 执行一步真实着法：完整规则校验 + 维护历史/计数器。
+    /// 返回 false 表示非法（棋子走法不对，或走后己方被将军 / 将帅照面）。
+    fn make_move(&mut self, mv: &Move, current_player: PieceColor) -> bool {
+        if !self.is_pseudo_legal(mv, current_player) {
+            return false;
+        }
+        let before = self.board;
+        let undo = self.apply_move(mv);
+        // 不能走出“自己送将”的棋：包括走后己方被将军，以及主动造成将帅照面
+        if in_check(&self.board, current_player) {
+            self.undo_move(mv, &undo);
             return false;
         }
 
-        let from_piece = self.get_piece(from_row, from_col);
-        let to_piece = self.get_piece(to_row, to_col);
+        let opp = opponent(current_player);
+        let gave_check = in_check(&self.board, opp);
+        let chasing = self.is_chasing(current_player, mv, &before);
+        let moved = self.get_piece(mv.to_row, mv.to_col);
+        let is_capture = !undo.captured.is_empty();
+        let is_soldier = moved.ptype == PieceType::Soldier;
+        // 兵/卒横向移动是可以走回去的，因此只有“吃子”和“兵卒向前”才真正不可逆
+        let irreversible = is_capture || (is_soldier && mv.to_row != mv.from_row);
+        // 50 回合规则：吃子或兵卒移动（含横走）都重置计数
+        let resets_fifty = is_capture || is_soldier;
 
-        if from_piece.ptype == PieceType::Empty || from_piece.color == PieceColor::None {
-            return false;
+        if irreversible {
+            // 不可逆着法之后不可能再重现旧局面，重复记录从头开始
+            self.history.clear();
+            self.hash_history.clear();
+            self.position_history.clear();
+            self.repetition_count = 0;
         }
-        if from_piece.color != current_player {
-            return false;
-        }
-        if to_piece.color == from_piece.color {
-            return false;
-        }
-        if !self.is_move_legal(from_row, from_col, to_row, to_col) {
-            return false;
-        }
-
-        let is_capture = to_piece.ptype != PieceType::Empty;
-        let is_soldier_move = from_piece.ptype == PieceType::Soldier;
-        if is_capture || is_soldier_move {
+        if resets_fifty {
             self.fifty_move_rule_counter = 0;
         } else {
             self.fifty_move_rule_counter += 1;
         }
 
-        self.update_zobrist_hash(from_row, from_col, to_row, to_col, to_piece);
-
-        self.set_piece(to_row, to_col, from_piece);
-        self.set_piece(from_row, from_col, Piece::new());
-
+        self.history.push(HistoryEntry {
+            mv: *mv,
+            mover: current_player,
+            moved,
+            captured: undo.captured,
+            gave_check,
+            chasing,
+            irreversible,
+            hash: self.zobrist_hash,
+        });
         self.record_position();
         true
     }
 
-    fn is_move_legal(&self, from_row: i32, from_col: i32, to_row: i32, to_col: i32) -> bool {
-        let from_piece = self.get_piece(from_row, from_col);
-        let to_piece = self.get_piece(to_row, to_col);
-
-        if from_piece.ptype == PieceType::Empty || from_piece.color == PieceColor::None {
-            return false;
+    /// 走完这一步之后，mover 是否构成“捉”。
+    ///
+    /// 判定标准（对应象棋规则里的“走子攻击”）：
+    /// 1. 被攻击的是对方将/帅以外的棋子；
+    /// 2. 该威胁必须是**这一步新造出来的** —— 由走动的那枚棋子发起，
+    ///    且它在走之前并没有攻击这个目标；
+    ///    （这样可以排除“走之前就已经存在的静态威胁”，避免把普通循环着法误判成长捉）
+    /// 3. 威胁成立：目标无保护（有保护的棋子对方无需应对，不构成真正的“捉”）。
+    fn is_chasing(&self, mover: PieceColor, mv: &Move, before: &Grid) -> bool {
+        let opp = opponent(mover);
+        let moved = g_get(&self.board, mv.to_row, mv.to_col);
+        if moved.is_empty() || moved.ptype == PieceType::General {
+            return false; // 将/帅本身不构成“捉”
         }
-        if from_piece.color == to_piece.color {
-            return false;
-        }
-
-        match from_piece.ptype {
-            PieceType::General => {
-                self.is_general_move_legal(from_row, from_col, to_row, to_col, from_piece.color)
-            }
-            PieceType::Advisor => {
-                self.is_advisor_move_legal(from_row, from_col, to_row, to_col, from_piece.color)
-            }
-            PieceType::Elephant => {
-                self.is_elephant_move_legal(from_row, from_col, to_row, to_col, from_piece.color)
-            }
-            PieceType::Horse => self.is_horse_move_legal(from_row, from_col, to_row, to_col),
-            PieceType::Chariot => self.is_chariot_move_legal(from_row, from_col, to_row, to_col),
-            PieceType::Cannon => self.is_cannon_move_legal(from_row, from_col, to_row, to_col),
-            PieceType::Soldier => {
-                self.is_soldier_move_legal(from_row, from_col, to_row, to_col, from_piece.color)
-            }
-            _ => false,
-        }
-    }
-
-    fn is_general_move_legal(
-        &self,
-        from_row: i32,
-        from_col: i32,
-        to_row: i32,
-        to_col: i32,
-        color: PieceColor,
-    ) -> bool {
-        let to_piece = self.get_piece(to_row, to_col);
-
-        // “飞将”：将帅照面，可直接吃掉对方将/帅
-        if to_piece.ptype == PieceType::General && to_piece.color != color {
-            if from_col != to_col {
-                return false;
-            }
-            let start_row = from_row.min(to_row) + 1;
-            let end_row = from_row.max(to_row);
-            for r in start_row..end_row {
-                if self.get_piece(r, from_col).ptype != PieceType::Empty {
-                    return false;
+        for r in 0..10i32 {
+            for c in 0..9i32 {
+                let target = g_get(&self.board, r, c);
+                if target.is_empty() || target.color != opp {
+                    continue;
+                }
+                if target.ptype == PieceType::General {
+                    continue;
+                }
+                // 必须是“走动的那枚棋子”发起的攻击
+                if !move_legal(&self.board, mv.to_row, mv.to_col, r, c) {
+                    continue;
+                }
+                // 走之前它就已经在攻击这个目标 -> 不是新威胁
+                if move_legal(before, mv.from_row, mv.from_col, r, c) {
+                    continue;
+                }
+                if !square_protected(&self.board, r, c, opp) {
+                    return true;
                 }
             }
-            return true;
-        }
-
-        // 九宫格限制
-        if color == PieceColor::Red {
-            if to_row < 7 || to_row > 9 || to_col < 3 || to_col > 5 {
-                return false;
-            }
-        } else {
-            if to_row < 0 || to_row > 2 || to_col < 3 || to_col > 5 {
-                return false;
-            }
-        }
-
-        let row_diff = (to_row - from_row).abs();
-        let col_diff = (to_col - from_col).abs();
-        (row_diff == 1 && col_diff == 0) || (row_diff == 0 && col_diff == 1)
-    }
-
-    fn is_advisor_move_legal(
-        &self,
-        from_row: i32,
-        from_col: i32,
-        to_row: i32,
-        to_col: i32,
-        color: PieceColor,
-    ) -> bool {
-        if color == PieceColor::Red {
-            if to_row < 7 || to_row > 9 || to_col < 3 || to_col > 5 {
-                return false;
-            }
-        } else {
-            if to_row < 0 || to_row > 2 || to_col < 3 || to_col > 5 {
-                return false;
-            }
-        }
-        let row_diff = (to_row - from_row).abs();
-        let col_diff = (to_col - from_col).abs();
-        row_diff == 1 && col_diff == 1
-    }
-
-    fn is_elephant_move_legal(
-        &self,
-        from_row: i32,
-        from_col: i32,
-        to_row: i32,
-        to_col: i32,
-        color: PieceColor,
-    ) -> bool {
-        if color == PieceColor::Red && to_row < 5 {
-            return false;
-        }
-        if color == PieceColor::Black && to_row > 4 {
-            return false;
-        }
-        let row_diff = (to_row - from_row).abs();
-        let col_diff = (to_col - from_col).abs();
-        if row_diff != 2 || col_diff != 2 {
-            return false;
-        }
-        let middle_row = (from_row + to_row) / 2;
-        let middle_col = (from_col + to_col) / 2;
-        self.get_piece(middle_row, middle_col).ptype == PieceType::Empty
-    }
-
-    fn is_horse_move_legal(&self, from_row: i32, from_col: i32, to_row: i32, to_col: i32) -> bool {
-        let row_diff = (to_row - from_row).abs();
-        let col_diff = (to_col - from_col).abs();
-
-        if !((row_diff == 2 && col_diff == 1) || (row_diff == 1 && col_diff == 2)) {
-            return false;
-        }
-        // 蹩马腿
-        if row_diff == 2 {
-            let middle_row = (from_row + to_row) / 2;
-            if self.get_piece(middle_row, from_col).ptype != PieceType::Empty {
-                return false;
-            }
-        } else {
-            let middle_col = (from_col + to_col) / 2;
-            if self.get_piece(from_row, middle_col).ptype != PieceType::Empty {
-                return false;
-            }
-        }
-        true
-    }
-
-    fn is_chariot_move_legal(&self, from_row: i32, from_col: i32, to_row: i32, to_col: i32) -> bool {
-        if from_row != to_row && from_col != to_col {
-            return false;
-        }
-        if from_row == to_row {
-            let start_col = from_col.min(to_col) + 1;
-            let end_col = from_col.max(to_col);
-            for c in start_col..end_col {
-                if self.get_piece(from_row, c).ptype != PieceType::Empty {
-                    return false;
-                }
-            }
-        } else {
-            let start_row = from_row.min(to_row) + 1;
-            let end_row = from_row.max(to_row);
-            for r in start_row..end_row {
-                if self.get_piece(r, from_col).ptype != PieceType::Empty {
-                    return false;
-                }
-            }
-        }
-        true
-    }
-
-    fn is_cannon_move_legal(&self, from_row: i32, from_col: i32, to_row: i32, to_col: i32) -> bool {
-        if from_row != to_row && from_col != to_col {
-            return false;
-        }
-        let to_piece = self.get_piece(to_row, to_col);
-        let mut pieces_between = 0;
-
-        if from_row == to_row {
-            let start_col = from_col.min(to_col) + 1;
-            let end_col = from_col.max(to_col);
-            for c in start_col..end_col {
-                if self.get_piece(from_row, c).ptype != PieceType::Empty {
-                    pieces_between += 1;
-                }
-            }
-        } else {
-            let start_row = from_row.min(to_row) + 1;
-            let end_row = from_row.max(to_row);
-            for r in start_row..end_row {
-                if self.get_piece(r, from_col).ptype != PieceType::Empty {
-                    pieces_between += 1;
-                }
-            }
-        }
-
-        if to_piece.ptype == PieceType::Empty {
-            pieces_between == 0
-        } else {
-            pieces_between == 1
-        }
-    }
-
-    fn is_soldier_move_legal(
-        &self,
-        from_row: i32,
-        from_col: i32,
-        to_row: i32,
-        to_col: i32,
-        color: PieceColor,
-    ) -> bool {
-        let row_diff = to_row - from_row;
-        let col_diff = (to_col - from_col).abs();
-
-        if color == PieceColor::Red && row_diff > 0 {
-            return false;
-        }
-        if color == PieceColor::Black && row_diff < 0 {
-            return false;
-        }
-
-        let is_crossed_river = (color == PieceColor::Red && from_row <= 4)
-            || (color == PieceColor::Black && from_row >= 5);
-
-        if is_crossed_river {
-            (row_diff.abs() == 1 && col_diff == 0) || (row_diff.abs() == 0 && col_diff == 1)
-        } else {
-            row_diff.abs() == 1 && col_diff == 0
-        }
-    }
-
-    fn is_in_check(&self, color: PieceColor) -> bool {
-        let mut general_row = -1i32;
-        let mut general_col = -1i32;
-        for r in 0..10 {
-            for c in 0..9 {
-                let piece = self.board[r][c];
-                if piece.ptype == PieceType::General && piece.color == color {
-                    general_row = r as i32;
-                    general_col = c as i32;
-                    break;
-                }
-            }
-            if general_row != -1 {
-                break;
-            }
-        }
-        if general_row == -1 {
-            return false;
-        }
-
-        let opponent = if color == PieceColor::Red {
-            PieceColor::Black
-        } else {
-            PieceColor::Red
-        };
-        for r in 0..10 {
-            for c in 0..9 {
-                let piece = self.board[r][c];
-                if piece.color == opponent {
-                    if self.is_move_legal(r as i32, c as i32, general_row, general_col) {
-                        return true;
-                    }
-                }
-            }
-        }
-
-        // 飞将情况
-        let mut opp_row = -1i32;
-        let mut opp_col = -1i32;
-        for r in 0..10 {
-            for c in 0..9 {
-                let piece = self.board[r][c];
-                if piece.ptype == PieceType::General && piece.color == opponent {
-                    opp_row = r as i32;
-                    opp_col = c as i32;
-                    break;
-                }
-            }
-            if opp_row != -1 {
-                break;
-            }
-        }
-        if opp_row == -1 {
-            return false;
-        }
-
-        if general_col == opp_col {
-            let start_row = general_row.min(opp_row) + 1;
-            let end_row = general_row.max(opp_row);
-            for r in start_row..end_row {
-                if self.get_piece(r, general_col).ptype != PieceType::Empty {
-                    return false;
-                }
-            }
-            return true;
         }
         false
     }
 
-    fn check_game_state(&self, current_player: PieceColor) -> GameState {
-        let mut red_has_general = false;
-        let mut black_has_general = false;
-        for r in 0..10 {
-            for c in 0..9 {
-                let piece = self.board[r][c];
-                if piece.ptype == PieceType::General {
-                    if piece.color == PieceColor::Red {
-                        red_has_general = true;
+    fn is_move_legal(&self, from_row: i32, from_col: i32, to_row: i32, to_col: i32) -> bool {
+        move_legal(&self.board, from_row, from_col, to_row, to_col)
+    }
+
+    fn is_in_check(&self, color: PieceColor) -> bool {
+        in_check(&self.board, color)
+    }
+
+    fn is_square_attacked(&self, row: i32, col: i32, attacker: PieceColor) -> bool {
+        square_attacked(&self.board, row, col, attacker)
+    }
+
+    #[allow(dead_code)]
+    fn is_square_protected(&self, row: i32, col: i32, defender: PieceColor) -> bool {
+        square_protected(&self.board, row, col, defender)
+    }
+
+    // -----------------------------------------------------------------------
+    // 着法生成
+    // -----------------------------------------------------------------------
+
+    /// 按棋子类型定向生成“伪合法”着法（可能走后自己被将军）
+    fn generate_pseudo_legal_moves(&self, color: PieceColor) -> Vec<Move> {
+        let mut moves: Vec<Move> = Vec::with_capacity(48);
+        let opp = opponent(color);
+
+        for r in 0..10i32 {
+            for c in 0..9i32 {
+                let p = g_get(&self.board, r, c);
+                if p.is_empty() || p.color != color {
+                    continue;
+                }
+                match p.ptype {
+                    PieceType::General => {
+                        for (dr, dc) in DIRS4 {
+                            let tr = r + dr;
+                            let tc = c + dc;
+                            if g_in_board(tr, tc) && move_legal(&self.board, r, c, tr, tc) {
+                                moves.push(Move::from_pos(r, c, tr, tc));
+                            }
+                        }
+                        // 飞将：同列且中间无子时直接吃对方将/帅
+                        if let Some((or, oc)) = find_general(&self.board, opp) {
+                            if move_legal(&self.board, r, c, or, oc) {
+                                moves.push(Move::from_pos(r, c, or, oc));
+                            }
+                        }
                     }
-                    if piece.color == PieceColor::Black {
-                        black_has_general = true;
+                    PieceType::Advisor => {
+                        for (dr, dc) in DIAG4 {
+                            let tr = r + dr;
+                            let tc = c + dc;
+                            if g_in_board(tr, tc) && move_legal(&self.board, r, c, tr, tc) {
+                                moves.push(Move::from_pos(r, c, tr, tc));
+                            }
+                        }
                     }
+                    PieceType::Elephant => {
+                        for (dr, dc) in ELEPHANT_DELTAS {
+                            let tr = r + dr;
+                            let tc = c + dc;
+                            if g_in_board(tr, tc) && move_legal(&self.board, r, c, tr, tc) {
+                                moves.push(Move::from_pos(r, c, tr, tc));
+                            }
+                        }
+                    }
+                    PieceType::Horse => {
+                        for (dr, dc) in HORSE_DELTAS {
+                            let tr = r + dr;
+                            let tc = c + dc;
+                            if g_in_board(tr, tc) && move_legal(&self.board, r, c, tr, tc) {
+                                moves.push(Move::from_pos(r, c, tr, tc));
+                            }
+                        }
+                    }
+                    PieceType::Chariot => {
+                        for (dr, dc) in DIRS4 {
+                            let mut tr = r + dr;
+                            let mut tc = c + dc;
+                            while g_in_board(tr, tc) {
+                                let tp = g_get(&self.board, tr, tc);
+                                if tp.is_empty() {
+                                    moves.push(Move::from_pos(r, c, tr, tc));
+                                } else {
+                                    if tp.color != color {
+                                        moves.push(Move::from_pos(r, c, tr, tc));
+                                    }
+                                    break;
+                                }
+                                tr += dr;
+                                tc += dc;
+                            }
+                        }
+                    }
+                    PieceType::Cannon => {
+                        for (dr, dc) in DIRS4 {
+                            // 无炮架：平移
+                            let mut tr = r + dr;
+                            let mut tc = c + dc;
+                            while g_in_board(tr, tc) && g_get(&self.board, tr, tc).is_empty() {
+                                moves.push(Move::from_pos(r, c, tr, tc));
+                                tr += dr;
+                                tc += dc;
+                            }
+                            // 越过一个炮架后遇到的第一个敌子可吃
+                            let mut er = tr + dr;
+                            let mut ec = tc + dc;
+                            while g_in_board(er, ec) {
+                                let tp = g_get(&self.board, er, ec);
+                                if !tp.is_empty() {
+                                    if tp.color != color {
+                                        moves.push(Move::from_pos(r, c, er, ec));
+                                    }
+                                    break;
+                                }
+                                er += dr;
+                                ec += dc;
+                            }
+                        }
+                    }
+                    PieceType::Soldier => {
+                        let forward = if color == PieceColor::Red { -1 } else { 1 };
+                        let tr = r + forward;
+                        if g_in_board(tr, c) && move_legal(&self.board, r, c, tr, c) {
+                            moves.push(Move::from_pos(r, c, tr, c));
+                        }
+                        if soldier_crossed(r, color) {
+                            for dc in [-1i32, 1] {
+                                let tc = c + dc;
+                                if g_in_board(r, tc) && move_legal(&self.board, r, c, r, tc) {
+                                    moves.push(Move::from_pos(r, c, r, tc));
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
-        if !red_has_general {
+        moves
+    }
+
+    /// 完整合法着法（过滤掉走后己方被将军的着法）
+    fn get_all_legal_moves(&self, color: PieceColor) -> Vec<Move> {
+        let pseudo = self.generate_pseudo_legal_moves(color);
+        let mut legal: Vec<Move> = Vec::with_capacity(pseudo.len());
+        let mut scratch = self.board;
+        for mv in pseudo {
+            let from_piece = g_get(&scratch, mv.from_row, mv.from_col);
+            let captured = g_get(&scratch, mv.to_row, mv.to_col);
+            g_set(&mut scratch, mv.to_row, mv.to_col, from_piece);
+            g_set(&mut scratch, mv.from_row, mv.from_col, Piece::new());
+            if !in_check(&scratch, color) {
+                legal.push(mv);
+            }
+            g_set(&mut scratch, mv.from_row, mv.from_col, from_piece);
+            g_set(&mut scratch, mv.to_row, mv.to_col, captured);
+        }
+        legal
+    }
+
+    // -----------------------------------------------------------------------
+    // 终局判定
+    // -----------------------------------------------------------------------
+
+    /// 判定当前局面是否终局。
+    /// 参数必须是 **待走子的一方**（原版错误地传入刚走完子的一方）。
+    fn check_game_state(&self, side_to_move: PieceColor) -> GameState {
+        // 1. 将帅存亡
+        if !self.has_general(PieceColor::Red) {
             return GameState::BlackWin;
         }
-        if !black_has_general {
+        if !self.has_general(PieceColor::Black) {
             return GameState::RedWin;
         }
 
-        if self.is_in_check(current_player) {
-            let legal = self.get_all_legal_moves(current_player);
-            if legal.is_empty() {
-                return if current_player == PieceColor::Red {
-                    GameState::BlackWin
-                } else {
-                    GameState::RedWin
-                };
+        // 2. 将死 / 困毙：无合法着法即判负（中国象棋困毙同样算负）
+        if self.get_all_legal_moves(side_to_move).is_empty() {
+            return if side_to_move == PieceColor::Red {
+                GameState::BlackWin
+            } else {
+                GameState::RedWin
+            };
+        }
+
+        // 3. 循环着法：长将 / 长捉 判负，双方均属禁止着法判和，否则三次重复判和
+        if self.is_threefold_repetition() {
+            let (red_kind, black_kind) = self.analyze_repetition();
+            match (red_kind, black_kind) {
+                (PerpetualKind::None, PerpetualKind::None) => return GameState::Draw,
+                (PerpetualKind::None, _) => return GameState::RedWin,
+                (_, PerpetualKind::None) => return GameState::BlackWin,
+                (_, _) => return GameState::Draw,
             }
         }
 
-        if self.is_threefold_repetition() {
-            return GameState::Draw;
-        }
+        // 4. 50 回合（100 步）无吃子且无兵卒移动
         if self.is_fifty_move_rule_draw() {
             return GameState::Draw;
         }
+
+        // 5. 双方均无足够进攻子力
         if self.is_insufficient_material() {
             return GameState::Draw;
         }
+
         GameState::Playing
+    }
+
+    /// 回溯“当前局面首次出现”以来的整个循环，给出双方的循环着法定性
+    fn analyze_repetition(&self) -> (PerpetualKind, PerpetualKind) {
+        let current = self.zobrist_hash;
+        let start = match self.hash_history.iter().position(|&h| h == current) {
+            Some(i) => i,
+            None => return (PerpetualKind::None, PerpetualKind::None),
+        };
+        // history[i] 是把 hash_history[i] 变成 hash_history[i+1] 的那一步
+        let cycle = &self.history[start..];
+        if cycle.is_empty() || cycle.iter().any(|e| e.irreversible) {
+            return (PerpetualKind::None, PerpetualKind::None);
+        }
+
+        let mut red_moves = 0i32;
+        let mut red_checks = 0i32;
+        let mut red_chases = 0i32;
+        let mut black_moves = 0i32;
+        let mut black_checks = 0i32;
+        let mut black_chases = 0i32;
+
+        for e in cycle {
+            if e.mover == PieceColor::Red {
+                red_moves += 1;
+                if e.gave_check {
+                    red_checks += 1;
+                }
+                if e.chasing {
+                    red_chases += 1;
+                }
+            } else {
+                black_moves += 1;
+                if e.gave_check {
+                    black_checks += 1;
+                }
+                if e.chasing {
+                    black_chases += 1;
+                }
+            }
+        }
+
+        let red_kind = if red_moves > 0 && red_checks == red_moves {
+            PerpetualKind::Check
+        } else if red_moves > 0 && red_chases == red_moves {
+            PerpetualKind::Chase
+        } else {
+            PerpetualKind::None
+        };
+        let black_kind = if black_moves > 0 && black_checks == black_moves {
+            PerpetualKind::Check
+        } else if black_moves > 0 && black_chases == black_moves {
+            PerpetualKind::Chase
+        } else {
+            PerpetualKind::None
+        };
+        (red_kind, black_kind)
     }
 
     fn is_insufficient_material(&self) -> bool {
@@ -833,71 +1397,96 @@ impl Board {
         for r in 0..10 {
             for c in 0..9 {
                 let piece = self.board[r][c];
-                if piece.ptype != PieceType::Empty {
-                    if piece.color == PieceColor::Red {
-                        red_pieces += 1;
-                        if matches!(
-                            piece.ptype,
-                            PieceType::Chariot | PieceType::Horse | PieceType::Cannon | PieceType::Soldier
-                        ) {
-                            red_attack += 1;
-                        }
-                    } else {
-                        black_pieces += 1;
-                        if matches!(
-                            piece.ptype,
-                            PieceType::Chariot | PieceType::Horse | PieceType::Cannon | PieceType::Soldier
-                        ) {
-                            black_attack += 1;
-                        }
+                if piece.is_empty() {
+                    continue;
+                }
+                let attacking = matches!(
+                    piece.ptype,
+                    PieceType::Chariot
+                        | PieceType::Horse
+                        | PieceType::Cannon
+                        | PieceType::Soldier
+                );
+                if piece.color == PieceColor::Red {
+                    red_pieces += 1;
+                    if attacking {
+                        red_attack += 1;
+                    }
+                } else {
+                    black_pieces += 1;
+                    if attacking {
+                        black_attack += 1;
                     }
                 }
             }
         }
 
+        // 双方都只剩将/帅
         if red_pieces == 1 && black_pieces == 1 {
             return true;
         }
-        if red_attack == 0 && black_attack == 0 {
-            return true;
-        }
-        false
+        // 双方都没有任何进攻子力（只剩仕/相之类）
+        red_attack == 0 && black_attack == 0
     }
 
-    fn get_all_legal_moves(&self, color: PieceColor) -> Vec<Move> {
-        let mut moves = Vec::new();
-        for from_row in 0..10 {
-            for from_col in 0..9 {
-                let from_piece = self.board[from_row][from_col];
-                if from_piece.color == color {
-                    for to_row in 0..10 {
-                        for to_col in 0..9 {
-                            if self.is_move_legal(from_row as i32, from_col as i32, to_row as i32, to_col as i32)
-                            {
-                                let mut test = self.clone();
-                                let test_move = Move::from_pos(
-                                    from_row as i32,
-                                    from_col as i32,
-                                    to_row as i32,
-                                    to_col as i32,
-                                );
-                                if test.move_piece(&test_move, color) && !test.is_in_check(color) {
-                                    moves.push(test_move);
-                                }
-                            }
-                        }
-                    }
-                }
+    fn win_reason(&self, side_to_move: PieceColor) -> String {
+        if !self.has_general(PieceColor::Red) {
+            return "红帅被吃".to_string();
+        }
+        if !self.has_general(PieceColor::Black) {
+            return "黑将被吃".to_string();
+        }
+        let (red_kind, black_kind) = self.analyze_repetition();
+        match (red_kind, black_kind) {
+            (PerpetualKind::None, PerpetualKind::None) => {}
+            (_, PerpetualKind::None) => {
+                return format!("红方{}，属禁止着法，判负", red_kind.name());
+            }
+            (PerpetualKind::None, _) => {
+                return format!("黑方{}，属禁止着法，判负", black_kind.name());
+            }
+            (_, _) => {
+                return format!(
+                    "双方循环着法均属禁止着法（红{} / 黑{}），判和",
+                    red_kind.name(),
+                    black_kind.name()
+                );
             }
         }
-        moves
+        let name = color_name(side_to_move);
+        if self.is_in_check(side_to_move) {
+            format!("{}被将死", name)
+        } else {
+            format!("{}无着可走（困毙）", name)
+        }
+    }
+
+    fn draw_reason(&self) -> String {
+        let (red_kind, black_kind) = self.analyze_repetition();
+        if red_kind != PerpetualKind::None && black_kind != PerpetualKind::None {
+            return format!(
+                "双方循环着法均属禁止着法（红{} / 黑{}），判和",
+                red_kind.name(),
+                black_kind.name()
+            );
+        }
+        if self.is_threefold_repetition() {
+            return "三次重复局面，判和".to_string();
+        }
+        if self.is_fifty_move_rule_draw() {
+            return "连续 50 回合（100 步）无吃子且无兵卒移动，判和".to_string();
+        }
+        if self.is_insufficient_material() {
+            return "双方均无足够进攻子力，判和".to_string();
+        }
+        "和棋".to_string()
     }
 
     fn get_game_phase(&self) -> GamePhase {
         let mut piece_count = 0;
         for i in 0..10 {
             for j in 0..9 {
-                if self.board[i][j].ptype != PieceType::Empty {
+                if !self.board[i][j].is_empty() {
                     piece_count += 1;
                 }
             }
@@ -935,20 +1524,6 @@ impl Board {
         println!("{}  └───┴───┴───┴───┴───┴───┴───┴───┴───┘{}", y, reset);
     }
 
-    fn is_square_attacked(&self, row: i32, col: i32, attacker_color: PieceColor) -> bool {
-        for r in 0..10 {
-            for c in 0..9 {
-                let piece = self.board[r][c];
-                if piece.color == attacker_color && piece.ptype != PieceType::Empty {
-                    if self.is_move_legal(r as i32, c as i32, row, col) {
-                        return true;
-                    }
-                }
-            }
-        }
-        false
-    }
-
     // -----------------------------------------------------------------------
     // 评估函数
     // -----------------------------------------------------------------------
@@ -959,35 +1534,34 @@ impl Board {
         for i in 0..10 {
             for j in 0..9 {
                 let piece = self.board[i][j];
-                if piece.ptype != PieceType::Empty && piece.color != PieceColor::None {
-                    let piece_score = PIECE_VALUES[piece.ptype as usize];
-                    let pos_bonus = self.get_position_bonus(i as i32, j as i32, piece.ptype, piece.color);
-                    let total = piece_score + pos_bonus;
+                if piece.is_empty() {
+                    continue;
+                }
+                let piece_score = PIECE_VALUES[piece.ptype as usize];
+                let pos_bonus =
+                    self.get_position_bonus(i as i32, j as i32, piece.ptype, piece.color);
+                let total = piece_score + pos_bonus;
 
-                    if (perspective == PieceColor::Red && piece.color == PieceColor::Red)
-                        || (perspective == PieceColor::Black && piece.color == PieceColor::Black)
-                    {
-                        score += total;
-                    } else {
-                        score -= total;
-                    }
+                if piece.color == perspective {
+                    score += total;
+                } else {
+                    score -= total;
                 }
             }
         }
 
         score += self.evaluate_safety(perspective);
 
-        let mobility = self.get_all_legal_moves(perspective).len() as i32;
-        let opp = if perspective == PieceColor::Red {
-            PieceColor::Black
-        } else {
-            PieceColor::Red
-        };
-        let opp_mobility = self.get_all_legal_moves(opp).len() as i32;
+        let opp = opponent(perspective);
+        let mobility = self.generate_pseudo_legal_moves(perspective).len() as i32;
+        let opp_mobility = self.generate_pseudo_legal_moves(opp).len() as i32;
         score += (mobility - opp_mobility) * 3;
 
         if self.is_in_check(opp) {
             score += 50;
+        }
+        if self.is_in_check(perspective) {
+            score -= 30;
         }
 
         let mut center_control = 0;
@@ -1071,10 +1645,11 @@ impl Board {
             PieceType::Cannon => bonus = CANNON_POS[adjusted_row as usize][col as usize],
             PieceType::Soldier => {
                 bonus = SOLDIER_POS[adjusted_row as usize][col as usize];
-                if (color == PieceColor::Red && row <= 4) || (color == PieceColor::Black && row >= 5) {
+                if soldier_crossed(row, color) {
                     bonus += 10;
                 }
-                if (color == PieceColor::Red && row <= 2) || (color == PieceColor::Black && row >= 7) {
+                if (color == PieceColor::Red && row <= 2) || (color == PieceColor::Black && row >= 7)
+                {
                     bonus += 15;
                 }
             }
@@ -1090,49 +1665,29 @@ impl Board {
 
     fn evaluate_safety(&self, perspective: PieceColor) -> i32 {
         let mut safety_score = 0;
-        let opp = if perspective == PieceColor::Red {
-            PieceColor::Black
-        } else {
-            PieceColor::Red
-        };
+        let opp = opponent(perspective);
 
-        for i in 0..10 {
-            for j in 0..9 {
-                let piece = self.board[i][j];
-                if piece.ptype != PieceType::Empty && piece.color == perspective {
-                    let is_attacked = self.is_square_attacked(i as i32, j as i32, opp);
-                    let is_protected = self.is_square_protected(i as i32, j as i32, perspective);
+        for i in 0..10i32 {
+            for j in 0..9i32 {
+                let piece = g_get(&self.board, i, j);
+                if piece.is_empty() || piece.color != perspective {
+                    continue;
+                }
+                let attacked = square_attacked(&self.board, i, j, opp);
+                let protected = square_protected(&self.board, i, j, perspective);
 
-                    if is_attacked {
-                        if !is_protected {
-                            safety_score -= piece.value() / 2;
-                        } else {
-                            safety_score -= piece.value() / 10;
-                        }
-                    } else if is_protected {
-                        safety_score += piece.value() / 20;
+                if attacked {
+                    if !protected {
+                        safety_score -= piece.value() / 2;
+                    } else {
+                        safety_score -= piece.value() / 10;
                     }
+                } else if protected {
+                    safety_score += piece.value() / 20;
                 }
             }
         }
         safety_score
-    }
-
-    fn is_square_protected(&self, row: i32, col: i32, defender_color: PieceColor) -> bool {
-        for r in 0..10 {
-            for c in 0..9 {
-                let piece = self.board[r][c];
-                if piece.color == defender_color && piece.ptype != PieceType::Empty {
-                    if r as i32 == row && c as i32 == col {
-                        continue;
-                    }
-                    if self.is_move_legal(r as i32, c as i32, row, col) {
-                        return true;
-                    }
-                }
-            }
-        }
-        false
     }
 
     fn evaluate_coordination(&self, perspective: PieceColor) -> i32 {
@@ -1144,30 +1699,29 @@ impl Board {
         for i in 0..10 {
             for j in 0..9 {
                 let piece = self.board[i][j];
-                if piece.color == perspective {
-                    match piece.ptype {
-                        PieceType::Chariot => {
-                            chariot_count += 1;
-                            if (perspective == PieceColor::Red && i <= 4)
-                                || (perspective == PieceColor::Black && i >= 5)
-                            {
-                                coordination += 15;
-                            }
+                if piece.color != perspective || piece.is_empty() {
+                    continue;
+                }
+                match piece.ptype {
+                    PieceType::Chariot => {
+                        chariot_count += 1;
+                        if soldier_crossed(i as i32, perspective) {
+                            coordination += 15;
                         }
-                        PieceType::Cannon => {
-                            cannon_count += 1;
-                            if i == 4 || i == 5 {
-                                coordination += 10;
-                            }
-                        }
-                        PieceType::Horse => {
-                            horse_count += 1;
-                            if i >= 3 && i <= 6 && j >= 3 && j <= 5 {
-                                coordination += 10;
-                            }
-                        }
-                        _ => {}
                     }
+                    PieceType::Cannon => {
+                        cannon_count += 1;
+                        if i == 4 || i == 5 {
+                            coordination += 10;
+                        }
+                    }
+                    PieceType::Horse => {
+                        horse_count += 1;
+                        if (3..=6).contains(&i) && (3..=5).contains(&j) {
+                            coordination += 10;
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -1186,18 +1740,18 @@ impl Board {
 
     fn evaluate_pawn_structure(&self, perspective: PieceColor) -> i32 {
         let mut pawn_score = 0;
-        let opp = if perspective == PieceColor::Red {
-            PieceColor::Black
-        } else {
-            PieceColor::Red
-        };
+        let opp = opponent(perspective);
 
         let mut pawn_count = 0;
         let mut connected_pawns = 0;
+        let mut opp_pawn_count = 0;
 
         for i in 0..10 {
             for j in 0..9 {
                 let piece = self.board[i][j];
+                if piece.is_empty() {
+                    continue;
+                }
                 if piece.ptype == PieceType::Soldier && piece.color == perspective {
                     pawn_count += 1;
 
@@ -1214,9 +1768,7 @@ impl Board {
                         }
                     }
 
-                    if (perspective == PieceColor::Red && i <= 4)
-                        || (perspective == PieceColor::Black && i >= 5)
-                    {
+                    if soldier_crossed(i as i32, perspective) {
                         pawn_score += 15;
                     }
                     if (perspective == PieceColor::Red && i <= 2)
@@ -1224,15 +1776,7 @@ impl Board {
                     {
                         pawn_score += 20;
                     }
-                }
-            }
-        }
-
-        let mut opp_pawn_count = 0;
-        for i in 0..10 {
-            for j in 0..9 {
-                let piece = self.board[i][j];
-                if piece.ptype == PieceType::Soldier && piece.color == opp {
+                } else if piece.ptype == PieceType::Soldier && piece.color == opp {
                     opp_pawn_count += 1;
                 }
             }
@@ -1249,13 +1793,14 @@ impl Board {
         for i in 0..10 {
             for j in 0..9 {
                 let piece = self.board[i][j];
-                if piece.ptype != PieceType::Empty {
-                    let value = PIECE_VALUES[piece.ptype as usize];
-                    if piece.color == perspective {
-                        score += value;
-                    } else {
-                        score -= value;
-                    }
+                if piece.is_empty() {
+                    continue;
+                }
+                let value = PIECE_VALUES[piece.ptype as usize];
+                if piece.color == perspective {
+                    score += value;
+                } else {
+                    score -= value;
                 }
             }
         }
@@ -1272,6 +1817,8 @@ struct ScoredMove {
     score: i32,
 }
 
+const MATE_SCORE: i32 = 100_000;
+
 struct AI {
     color: PieceColor,
     difficulty: AIDifficulty,
@@ -1279,6 +1826,8 @@ struct AI {
     max_search_time: Duration,
     start_time: Instant,
     timeout: bool,
+    /// 搜索路径上的局面哈希，用于搜索内部识别重复局面
+    search_path: Vec<u64>,
 }
 
 impl AI {
@@ -1290,33 +1839,35 @@ impl AI {
             max_search_time: Duration::from_millis(1000),
             start_time: Instant::now(),
             timeout: false,
+            search_path: Vec::new(),
         }
     }
 
-    fn get_best_move(&mut self, board: &Board) -> Move {
+    fn get_best_move(&mut self, board: &mut Board) -> Move {
         self.nodes_evaluated = 0;
         self.timeout = false;
+        self.search_path.clear();
+        self.search_path.push(board.zobrist_hash);
+        self.start_time = Instant::now();
+
+        // 原版四个难度统一 1000ms
+        match self.difficulty {
+            AIDifficulty::Level1
+            | AIDifficulty::Level2
+            | AIDifficulty::Level3
+            | AIDifficulty::Level4 => self.max_search_time = Duration::from_millis(1000),
+        }
 
         let legal_moves = board.get_all_legal_moves(self.color);
         if legal_moves.is_empty() {
             return Move::new();
         }
 
-        // 原版代码中四个难度统一设置为 1000ms
-        match self.difficulty {
-            AIDifficulty::Level1 => self.max_search_time = Duration::from_millis(1000),
-            AIDifficulty::Level2 => self.max_search_time = Duration::from_millis(1000),
-            AIDifficulty::Level3 => self.max_search_time = Duration::from_millis(1000),
-            AIDifficulty::Level4 => self.max_search_time = Duration::from_millis(1000),
-        }
-
-        self.start_time = Instant::now();
-
         let mut best_move = match self.difficulty {
             AIDifficulty::Level1 => self.get_smart_heuristic_move(board, &legal_moves),
-            AIDifficulty::Level2 => self.get_enhanced_minimax_move(board, &legal_moves, 2),
-            AIDifficulty::Level3 => self.get_enhanced_minimax_move(board, &legal_moves, 3),
-            AIDifficulty::Level4 => self.get_time_limited_advanced_move(board, &legal_moves),
+            AIDifficulty::Level2 => self.search_root(board, &legal_moves, 2),
+            AIDifficulty::Level3 => self.search_root(board, &legal_moves, 3),
+            AIDifficulty::Level4 => self.iterative_deepening(board, &legal_moves, 6),
         };
 
         // 未找到好着法时使用启发式
@@ -1324,14 +1875,31 @@ impl AI {
             best_move = self.get_smart_heuristic_move(board, &legal_moves);
         }
 
-        // 最后安全检查：确保移动不会立即被吃掉
+        // 能直接将死就直接采用
+        {
+            let opp = opponent(self.color);
+            let mut after = board.clone();
+            after.apply_move(&best_move);
+            if in_check(&after.board, opp) && after.get_all_legal_moves(opp).is_empty() {
+                best_move.score = MATE_SCORE;
+                return best_move;
+            }
+        }
+
+        // 安全检查：若选出的着法会白丢子，换成不吃亏的最佳着法
         if !self.is_move_safe(board, &best_move) {
-            for &mv in &legal_moves {
-                if self.is_move_safe(board, &mv) {
-                    best_move = mv;
-                    best_move.score = self.evaluate_move_safety(board, &mv);
-                    break;
-                }
+            let mut candidates: Vec<ScoredMove> = legal_moves
+                .iter()
+                .filter(|m| self.is_move_safe(board, m))
+                .map(|&m| ScoredMove {
+                    mv: m,
+                    score: self.evaluate_move_safety(board, &m),
+                })
+                .collect();
+            candidates.sort_by(|a, b| b.score.cmp(&a.score));
+            if let Some(c) = candidates.first() {
+                best_move = c.mv;
+                best_move.score = c.score;
             }
         }
 
@@ -1357,50 +1925,33 @@ impl AI {
         self.timeout
     }
 
+    /// 这步棋是否“不吃亏”（静态交换评估 >= 0）
     fn is_move_safe(&self, board: &Board, mv: &Move) -> bool {
-        let opp = if self.color == PieceColor::Red {
-            PieceColor::Black
-        } else {
-            PieceColor::Red
-        };
-
-        let mut test = board.clone();
-        if !test.move_piece(mv, self.color) {
-            return false;
-        }
-        if test.is_square_attacked(mv.to_row, mv.to_col, opp) {
-            if !test.is_square_protected(mv.to_row, mv.to_col, self.color) {
-                return false;
-            }
-        }
-        true
+        see_move(&board.board, mv, self.color) >= 0
     }
 
     fn evaluate_move_safety(&self, board: &Board, mv: &Move) -> i32 {
-        let mut safety_score = 100;
-
-        let moved_piece = board.get_piece(mv.from_row, mv.from_col);
-        let target_piece = board.get_piece(mv.to_row, mv.to_col);
-        let opp = if self.color == PieceColor::Red {
-            PieceColor::Black
-        } else {
-            PieceColor::Red
-        };
-
-        let mut test = board.clone();
-        if !test.move_piece(mv, self.color) {
+        let mut scratch = board.board;
+        let moved_piece = g_get(&scratch, mv.from_row, mv.from_col);
+        let target_piece = g_get(&scratch, mv.to_row, mv.to_col);
+        if moved_piece.is_empty() {
             return -1000;
         }
+        g_set(&mut scratch, mv.to_row, mv.to_col, moved_piece);
+        g_set(&mut scratch, mv.from_row, mv.from_col, Piece::new());
 
-        // 1. 移动后是否被将军
-        if test.is_in_check(self.color) {
+        let opp = opponent(self.color);
+        let mut safety_score = 100;
+
+        // 1. 移动后是否被将军（含将帅照面）
+        if in_check(&scratch, self.color) {
             safety_score -= 500;
         }
 
         // 2. 移动后棋子是否被攻击
-        if test.is_square_attacked(mv.to_row, mv.to_col, opp) {
+        if square_attacked(&scratch, mv.to_row, mv.to_col, opp) {
             safety_score -= 100;
-            if !test.is_square_protected(mv.to_row, mv.to_col, self.color) {
+            if !square_protected(&scratch, mv.to_row, mv.to_col, self.color) {
                 safety_score -= 200;
                 if moved_piece.value() > 50 {
                     safety_score -= 100;
@@ -1409,66 +1960,18 @@ impl AI {
         }
 
         // 3. 吃子判断
-        if target_piece.ptype != PieceType::Empty {
-            if (moved_piece.value() as f64) < (target_piece.value() as f64) * 1.5 {
-                safety_score += target_piece.value();
-            }
+        if !target_piece.is_empty()
+            && (moved_piece.value() as f64) < (target_piece.value() as f64) * 1.5
+        {
+            safety_score += target_piece.value();
         }
 
-        // 4. 是否暴露重要棋子
-        if self.exposes_important_piece(board, mv) {
-            safety_score -= 150;
-        }
-
-        // 5. 移动到安全位置加分
-        if !test.is_square_attacked(mv.to_row, mv.to_col, opp) {
+        // 4. 走到安全位置
+        if !square_attacked(&scratch, mv.to_row, mv.to_col, opp) {
             safety_score += 50;
         }
 
         safety_score
-    }
-
-    fn exposes_important_piece(&self, board: &Board, mv: &Move) -> bool {
-        let moved_piece = board.get_piece(mv.from_row, mv.from_col);
-        let opp = if self.color == PieceColor::Red {
-            PieceColor::Black
-        } else {
-            PieceColor::Red
-        };
-
-        if matches!(
-            moved_piece.ptype,
-            PieceType::Chariot | PieceType::Cannon | PieceType::Horse
-        ) {
-            let mut general_row = -1i32;
-            let mut general_col = -1i32;
-            for r in 0..10 {
-                for c in 0..9 {
-                    let piece = board.board[r][c];
-                    if piece.ptype == PieceType::General && piece.color == self.color {
-                        general_row = r as i32;
-                        general_col = c as i32;
-                        break;
-                    }
-                }
-                if general_row != -1 {
-                    break;
-                }
-            }
-
-            if general_row != -1 {
-                let distance =
-                    (mv.from_row - general_row).abs() + (mv.from_col - general_col).abs();
-                if distance <= 3 {
-                    let mut test = board.clone();
-                    test.move_piece(mv, self.color);
-                    if test.is_square_attacked(general_row, general_col, opp) {
-                        return true;
-                    }
-                }
-            }
-        }
-        false
     }
 
     fn get_smart_heuristic_move(&self, board: &Board, moves: &[Move]) -> Move {
@@ -1482,45 +1985,35 @@ impl AI {
 
             // 吃子奖励
             let target = board.get_piece(mv.to_row, mv.to_col);
-            if target.ptype != PieceType::Empty {
+            if !target.is_empty() {
                 score += target.value() * 3;
             }
 
             // 移动后是否将军
-            let mut test = board.clone();
-            if test.move_piece(&mv, self.color) {
-                let opp = if self.color == PieceColor::Red {
-                    PieceColor::Black
-                } else {
-                    PieceColor::Red
-                };
-                if test.is_in_check(opp) {
-                    score += 80;
-                }
+            let mut scratch = board.board;
+            let mover = g_get(&scratch, mv.from_row, mv.from_col);
+            g_set(&mut scratch, mv.to_row, mv.to_col, mover);
+            g_set(&mut scratch, mv.from_row, mv.from_col, Piece::new());
+            if in_check(&scratch, opponent(self.color)) {
+                score += 80;
             }
 
             // 安全性评估
             score += self.evaluate_move_safety(board, &mv);
 
             // 棋子发展到好位置
-            let moved_piece = board.get_piece(mv.from_row, mv.from_col);
             score += self.get_position_score(
                 mv.to_row,
                 mv.to_col,
-                moved_piece.ptype,
-                moved_piece.color,
+                mover.ptype,
+                mover.color,
             );
 
             // 协调性
             score += self.evaluate_move_coordination(board, &mv);
 
-            // 避免重复移动
-            if self.is_repeat_move(board, &mv) {
-                score -= 30;
-            }
-
             // 兵/卒前进奖励
-            if moved_piece.ptype == PieceType::Soldier {
+            if mover.ptype == PieceType::Soldier {
                 if (self.color == PieceColor::Red && mv.to_row < mv.from_row)
                     || (self.color == PieceColor::Black && mv.to_row > mv.from_row)
                 {
@@ -1533,6 +2026,7 @@ impl AI {
 
         scored_moves.sort_by(|a, b| b.score.cmp(&a.score));
 
+        // 优先挑“不吃亏”的高分着法
         for i in 0..scored_moves.len().min(5) {
             if self.is_move_safe(board, &scored_moves[i].mv) {
                 return scored_moves[i].mv;
@@ -1543,7 +2037,7 @@ impl AI {
 
     fn get_position_score(&self, row: i32, col: i32, ptype: PieceType, color: PieceColor) -> i32 {
         if ptype == PieceType::Horse {
-            if row >= 3 && row <= 6 && col >= 3 && col <= 5 {
+            if (3..=6).contains(&row) && (3..=5).contains(&col) {
                 return 15;
             }
         } else if ptype == PieceType::Chariot {
@@ -1557,10 +2051,8 @@ impl AI {
             if row == 4 || row == 5 {
                 return 10;
             }
-        } else if ptype == PieceType::Soldier {
-            if (color == PieceColor::Red && row <= 4) || (color == PieceColor::Black && row >= 5) {
-                return 15;
-            }
+        } else if ptype == PieceType::Soldier && soldier_crossed(row, color) {
+            return 15;
         }
         0
     }
@@ -1570,32 +2062,32 @@ impl AI {
         let moved_piece = board.get_piece(mv.from_row, mv.from_col);
 
         if matches!(moved_piece.ptype, PieceType::Chariot | PieceType::Cannon) {
-            for r in 0..10 {
-                for c in 0..9 {
-                    if r as i32 == mv.from_row && c as i32 == mv.from_col {
+            for r in 0..10i32 {
+                for c in 0..9i32 {
+                    if r == mv.from_row && c == mv.from_col {
                         continue;
                     }
-                    let piece = board.board[r][c];
+                    let piece = board.get_piece(r, c);
                     if piece.color == self.color
                         && matches!(piece.ptype, PieceType::Chariot | PieceType::Cannon)
                     {
-                        if mv.to_row == r as i32 || mv.to_col == c as i32 {
+                        if mv.to_row == r || mv.to_col == c {
                             coordination += 10;
                         }
                     }
                 }
             }
         } else if moved_piece.ptype == PieceType::Horse {
-            for r in 0..10 {
-                for c in 0..9 {
-                    if r as i32 == mv.from_row && c as i32 == mv.from_col {
+            for r in 0..10i32 {
+                for c in 0..9i32 {
+                    if r == mv.from_row && c == mv.from_col {
                         continue;
                     }
-                    let piece = board.board[r][c];
+                    let piece = board.get_piece(r, c);
                     if piece.color == self.color
                         && matches!(piece.ptype, PieceType::Chariot | PieceType::Cannon)
                     {
-                        let distance = (mv.to_row - r as i32).abs() + (mv.to_col - c as i32).abs();
+                        let distance = (mv.to_row - r).abs() + (mv.to_col - c).abs();
                         if distance <= 3 {
                             coordination += 8;
                         }
@@ -1606,327 +2098,173 @@ impl AI {
         coordination
     }
 
-    fn is_repeat_move(&self, _board: &Board, _mv: &Move) -> bool {
-        // 原版为简化实现，恒返回 false
-        false
+    /// 根节点着法排序（吃子优先 + SEE + 安全性）
+    fn order_root(&self, board: &Board, moves: &[Move]) -> Vec<ScoredMove> {
+        let mut v: Vec<ScoredMove> = Vec::with_capacity(moves.len());
+        for &mv in moves {
+            let target = board.get_piece(mv.to_row, mv.to_col);
+            let mover = board.get_piece(mv.from_row, mv.from_col);
+            let mut score = see_move(&board.board, &mv, self.color) * 4;
+            if !target.is_empty() {
+                score += target.value() * 8 - mover.value();
+            }
+            score += self.evaluate_move_safety(board, &mv) / 4;
+            v.push(ScoredMove { mv, score });
+        }
+        v.sort_by(|a, b| b.score.cmp(&a.score));
+        v
     }
 
-    fn get_enhanced_minimax_move(&mut self, board: &Board, moves: &[Move], depth: i32) -> Move {
+    fn search_root(&mut self, board: &mut Board, moves: &[Move], depth: i32) -> Move {
         if moves.is_empty() || depth <= 0 {
             return self.get_smart_heuristic_move(board, moves);
         }
-
-        let mut best_move = moves[0];
+        let order = self.order_root(board, moves);
+        let mut best_move = order[0].mv;
         let mut best_score = i32::MIN;
+        let mut alpha = i32::MIN;
 
-        // 移动排序
-        let mut scored_moves: Vec<ScoredMove> = Vec::new();
-        for &mv in moves {
-            let mut score = self.evaluate_move_safety(board, &mv);
-            let target = board.get_piece(mv.to_row, mv.to_col);
-            score += target.value() * 2;
-            scored_moves.push(ScoredMove { mv, score });
-        }
-        scored_moves.sort_by(|a, b| b.score.cmp(&a.score));
-
-        let search_limit = scored_moves.len().min(15);
-
-        for i in 0..search_limit {
-            let mv = scored_moves[i].mv;
-            let mut test = board.clone();
-            if !test.move_piece(&mv, self.color) {
-                continue;
+        for sm in &order {
+            if self.check_timeout() && best_score > i32::MIN {
+                break;
             }
-            let score = self.enhanced_minimax(
-                &test,
-                depth - 1,
-                false,
-                i32::MIN,
-                i32::MAX,
-                true,
-            );
+            let undo = board.apply_move(&sm.mv);
+            let score = if self.is_repetition(board) {
+                0
+            } else {
+                self.search_path.push(board.zobrist_hash);
+                let s = self.alphabeta(board, depth - 1, 1, false, alpha, i32::MAX);
+                self.search_path.pop();
+                s
+            };
+            board.undo_move(&sm.mv, &undo);
+
             if score > best_score {
                 best_score = score;
-                best_move = mv;
+                best_move = sm.mv;
                 best_move.score = score;
-            }
-        }
-        best_move
-    }
-
-    fn enhanced_minimax(
-        &mut self,
-        board: &Board,
-        depth: i32,
-        maximizing_player: bool,
-        mut alpha: i32,
-        mut beta: i32,
-        use_quiescence: bool,
-    ) -> i32 {
-        self.nodes_evaluated += 1;
-
-        if self.check_timeout() || depth == 0 {
-            let mut eval = board.evaluate(self.color);
-            if use_quiescence && depth == 0 && eval.abs() < 500 {
-                eval = self.quiescence_search(board, 3, alpha, beta, maximizing_player);
-            }
-            return eval;
-        }
-
-        let current_player = if maximizing_player {
-            self.color
-        } else if self.color == PieceColor::Red {
-            PieceColor::Black
-        } else {
-            PieceColor::Red
-        };
-
-        let state = board.check_game_state(current_player);
-        if state != GameState::Playing {
-            return self.get_terminal_score(state);
-        }
-
-        let legal_moves = board.get_all_legal_moves(current_player);
-        if legal_moves.is_empty() {
-            return if maximizing_player { -10000 } else { 10000 };
-        }
-
-        // 移动排序：吃子优先、安全性优先
-        let mut scored_moves: Vec<ScoredMove> = Vec::new();
-        for &mv in &legal_moves {
-            let mut score = 0;
-            let target = board.get_piece(mv.to_row, mv.to_col);
-            if target.ptype != PieceType::Empty {
-                score += 10000 + target.value() * 2;
-            }
-            score += self.evaluate_move_safety(board, &mv) / 10;
-            scored_moves.push(ScoredMove { mv, score });
-        }
-        scored_moves.sort_by(|a, b| b.score.cmp(&a.score));
-
-        if maximizing_player {
-            let mut max_eval = i32::MIN;
-            for sm in &scored_moves {
-                let mut test = board.clone();
-                test.move_piece(&sm.mv, current_player);
-                let eval = self.enhanced_minimax(&test, depth - 1, false, alpha, beta, use_quiescence);
-                max_eval = max_eval.max(eval);
-                alpha = alpha.max(eval);
-                if beta <= alpha {
-                    break;
-                }
-            }
-            max_eval
-        } else {
-            let mut min_eval = i32::MAX;
-            for sm in &scored_moves {
-                let mut test = board.clone();
-                test.move_piece(&sm.mv, current_player);
-                let eval = self.enhanced_minimax(&test, depth - 1, true, alpha, beta, use_quiescence);
-                min_eval = min_eval.min(eval);
-                beta = beta.min(eval);
-                if beta <= alpha {
-                    break;
-                }
-            }
-            min_eval
-        }
-    }
-
-    fn quiescence_search(
-        &mut self,
-        board: &Board,
-        depth: i32,
-        mut alpha: i32,
-        mut beta: i32,
-        maximizing_player: bool,
-    ) -> i32 {
-        self.nodes_evaluated += 1;
-
-        let stand_pat = board.evaluate(self.color);
-        if depth == 0 {
-            return stand_pat;
-        }
-
-        if maximizing_player {
-            if stand_pat >= beta {
-                return beta;
-            }
-            if alpha < stand_pat {
-                alpha = stand_pat;
-            }
-        } else {
-            if stand_pat <= alpha {
-                return alpha;
-            }
-            if beta > stand_pat {
-                beta = stand_pat;
-            }
-        }
-
-        // 只生成吃子着法
-        let current_player = if maximizing_player {
-            self.color
-        } else if self.color == PieceColor::Red {
-            PieceColor::Black
-        } else {
-            PieceColor::Red
-        };
-        let all_moves = board.get_all_legal_moves(current_player);
-        let mut capture_moves: Vec<Move> = Vec::new();
-        for mv in all_moves {
-            let target = board.get_piece(mv.to_row, mv.to_col);
-            if target.ptype != PieceType::Empty {
-                capture_moves.push(mv);
-            }
-        }
-        capture_moves.sort_by(|a, b| {
-            board
-                .get_piece(b.to_row, b.to_col)
-                .value()
-                .cmp(&board.get_piece(a.to_row, a.to_col).value())
-        });
-
-        if maximizing_player {
-            for mv in capture_moves {
-                let moved_piece = board.get_piece(mv.from_row, mv.from_col);
-                let target = board.get_piece(mv.to_row, mv.to_col);
-                // 吃子不利（被吃价值更高）则跳过
-                if (moved_piece.value() as f64) > (target.value() as f64) * 1.5 {
-                    continue;
-                }
-                let mut test = board.clone();
-                test.move_piece(&mv, current_player);
-                let score = self.quiescence_search(&test, depth - 1, alpha, beta, false);
-                if score >= beta {
-                    return beta;
-                }
                 if score > alpha {
                     alpha = score;
                 }
             }
-            alpha
-        } else {
-            for mv in capture_moves {
-                let moved_piece = board.get_piece(mv.from_row, mv.from_col);
-                let target = board.get_piece(mv.to_row, mv.to_col);
-                if (moved_piece.value() as f64) > (target.value() as f64) * 1.5 {
-                    continue;
-                }
-                let mut test = board.clone();
-                test.move_piece(&mv, current_player);
-                let score = self.quiescence_search(&test, depth - 1, alpha, beta, true);
-                if score <= alpha {
-                    return alpha;
-                }
-                if score < beta {
-                    beta = score;
-                }
-            }
-            beta
         }
+        best_move
     }
 
-    fn get_time_limited_advanced_move(&mut self, board: &Board, moves: &[Move]) -> Move {
+    fn iterative_deepening(&mut self, board: &mut Board, moves: &[Move], max_depth: i32) -> Move {
         if moves.is_empty() {
             return Move::new();
         }
+        let order = self.order_root(board, moves);
+        let mut best_move = order[0].mv;
 
-        let mut scored_moves: Vec<ScoredMove> = Vec::new();
-        for &mv in moves {
-            let mut score = self.evaluate_move_safety(board, &mv) * 2;
-            let target = board.get_piece(mv.to_row, mv.to_col);
-            score += target.value() * 3;
-            scored_moves.push(ScoredMove { mv, score });
-        }
-        scored_moves.sort_by(|a, b| b.score.cmp(&a.score));
+        for depth in 1..=max_depth {
+            let mut cur_best = best_move;
+            let mut cur_score = i32::MIN;
+            let mut alpha = i32::MIN;
+            let mut completed = true;
 
-        let search_limit = scored_moves.len().min(10);
-
-        let mut best_move = scored_moves[0].mv;
-        let mut best_score = i32::MIN;
-
-        // 迭代深化
-        for depth in 1..=5 {
-            if self.check_timeout() {
-                break;
-            }
-            let mut current_best_score = i32::MIN;
-            let mut current_best_move = best_move;
-
-            for i in 0..search_limit {
+            for sm in &order {
                 if self.check_timeout() {
+                    completed = false;
                     break;
                 }
-                let mv = scored_moves[i].mv;
-                let mut test = board.clone();
-                if !test.move_piece(&mv, self.color) {
-                    continue;
-                }
-                let score = self.time_limited_advanced_search(
-                    &test,
-                    depth,
-                    false,
-                    i32::MIN,
-                    i32::MAX,
-                );
-                if score > current_best_score {
-                    current_best_score = score;
-                    current_best_move = mv;
-                    current_best_move.score = score;
+                let undo = board.apply_move(&sm.mv);
+                let score = if self.is_repetition(board) {
+                    0
+                } else {
+                    self.search_path.push(board.zobrist_hash);
+                    let s = self.alphabeta(board, depth - 1, 1, false, alpha, i32::MAX);
+                    self.search_path.pop();
+                    s
+                };
+                board.undo_move(&sm.mv, &undo);
+
+                if score > cur_score {
+                    cur_score = score;
+                    cur_best = sm.mv;
+                    cur_best.score = score;
+                    if score > alpha {
+                        alpha = score;
+                    }
                 }
             }
 
-            if !self.check_timeout() && current_best_score > best_score {
-                best_score = current_best_score;
-                best_move = current_best_move;
+            if cur_score > i32::MIN {
+                best_move = cur_best;
             }
-
-            if best_score > 500 {
+            if !completed {
                 break;
+            }
+            if cur_score >= MATE_SCORE - 64 {
+                break; // 已找到杀棋，不必再深搜
             }
         }
         best_move
     }
 
-    fn time_limited_advanced_search(
+    /// 当前局面是否已在搜索路径上出现过（重复局面按和棋处理）
+    fn is_repetition(&self, board: &Board) -> bool {
+        self.search_path.contains(&board.zobrist_hash)
+    }
+
+    fn alphabeta(
         &mut self,
-        board: &Board,
+        board: &mut Board,
         depth: i32,
+        ply: i32,
         maximizing_player: bool,
         mut alpha: i32,
         mut beta: i32,
     ) -> i32 {
         self.nodes_evaluated += 1;
 
-        if self.check_timeout() || depth == 0 {
+        if self.check_timeout() {
             return board.evaluate(self.color);
         }
 
-        let current_player = if maximizing_player {
+        let stm = if maximizing_player {
             self.color
-        } else if self.color == PieceColor::Red {
-            PieceColor::Black
         } else {
-            PieceColor::Red
+            opponent(self.color)
         };
 
-        let state = board.check_game_state(current_player);
-        if state != GameState::Playing {
-            return self.get_terminal_score(state);
+        // 将帅被吃
+        if !board.has_general(stm) {
+            return if stm == self.color {
+                -(MATE_SCORE - ply)
+            } else {
+                MATE_SCORE - ply
+            };
         }
 
-        let legal_moves = board.get_all_legal_moves(current_player);
-        if legal_moves.is_empty() {
-            return if maximizing_player { -10000 } else { 10000 };
+        let mut d = depth;
+        if d <= 0 {
+            if in_check(&board.board, stm) {
+                d = 1; // 被将军时延伸一层，避免漏算杀棋
+            } else {
+                return self.quiescence(board, ply, 2, alpha, beta, maximizing_player);
+            }
         }
 
-        let mut scored_moves: Vec<ScoredMove> = Vec::new();
-        for &mv in &legal_moves {
+        let moves = board.get_all_legal_moves(stm);
+        if moves.is_empty() {
+            // 将死或困毙：待走子方判负
+            return if stm == self.color {
+                -(MATE_SCORE - ply)
+            } else {
+                MATE_SCORE - ply
+            };
+        }
+
+        // 移动排序：MVV-LVA（吃子优先，优先用小子吃大子）
+        let mut scored_moves: Vec<ScoredMove> = Vec::with_capacity(moves.len());
+        for &mv in &moves {
             let mut score = 0;
             let target = board.get_piece(mv.to_row, mv.to_col);
-            score += target.value();
-            score += self.evaluate_move_safety(board, &mv) / 20;
+            if !target.is_empty() {
+                score += 1000 + target.value() * 8 - board.get_piece(mv.from_row, mv.from_col).value();
+            }
             scored_moves.push(ScoredMove { mv, score });
         }
         scored_moves.sort_by(|a, b| b.score.cmp(&a.score));
@@ -1934,16 +2272,24 @@ impl AI {
         if maximizing_player {
             let mut max_eval = i32::MIN;
             for sm in &scored_moves {
-                if self.check_timeout() {
-                    break;
+                let undo = board.apply_move(&sm.mv);
+                let eval = if self.is_repetition(board) {
+                    0
+                } else {
+                    self.search_path.push(board.zobrist_hash);
+                    let s = self.alphabeta(board, d - 1, ply + 1, false, alpha, beta);
+                    self.search_path.pop();
+                    s
+                };
+                board.undo_move(&sm.mv, &undo);
+
+                if eval > max_eval {
+                    max_eval = eval;
                 }
-                let mut test = board.clone();
-                test.move_piece(&sm.mv, current_player);
-                let eval =
-                    self.time_limited_advanced_search(&test, depth - 1, false, alpha, beta);
-                max_eval = max_eval.max(eval);
-                alpha = alpha.max(eval);
-                if beta <= alpha {
+                if max_eval > alpha {
+                    alpha = max_eval;
+                }
+                if alpha >= beta {
                     break;
                 }
             }
@@ -1951,16 +2297,24 @@ impl AI {
         } else {
             let mut min_eval = i32::MAX;
             for sm in &scored_moves {
-                if self.check_timeout() {
-                    break;
+                let undo = board.apply_move(&sm.mv);
+                let eval = if self.is_repetition(board) {
+                    0
+                } else {
+                    self.search_path.push(board.zobrist_hash);
+                    let s = self.alphabeta(board, d - 1, ply + 1, true, alpha, beta);
+                    self.search_path.pop();
+                    s
+                };
+                board.undo_move(&sm.mv, &undo);
+
+                if eval < min_eval {
+                    min_eval = eval;
                 }
-                let mut test = board.clone();
-                test.move_piece(&sm.mv, current_player);
-                let eval =
-                    self.time_limited_advanced_search(&test, depth - 1, true, alpha, beta);
-                min_eval = min_eval.min(eval);
-                beta = beta.min(eval);
-                if beta <= alpha {
+                if min_eval < beta {
+                    beta = min_eval;
+                }
+                if alpha >= beta {
                     break;
                 }
             }
@@ -1968,17 +2322,111 @@ impl AI {
         }
     }
 
-    fn get_terminal_score(&self, state: GameState) -> i32 {
-        if (state == GameState::RedWin && self.color == PieceColor::Red)
-            || (state == GameState::BlackWin && self.color == PieceColor::Black)
-        {
-            10000
-        } else if (state == GameState::RedWin && self.color == PieceColor::Black)
-            || (state == GameState::BlackWin && self.color == PieceColor::Red)
-        {
-            -10000
+    fn quiescence(
+        &mut self,
+        board: &mut Board,
+        ply: i32,
+        qdepth: i32,
+        mut alpha: i32,
+        mut beta: i32,
+        maximizing_player: bool,
+    ) -> i32 {
+        self.nodes_evaluated += 1;
+
+        if self.check_timeout() {
+            return board.evaluate(self.color);
+        }
+
+        let stand_pat = board.evaluate(self.color);
+        if qdepth <= 0 {
+            return stand_pat;
+        }
+
+        let stm = if maximizing_player {
+            self.color
         } else {
-            0
+            opponent(self.color)
+        };
+
+        if maximizing_player {
+            if stand_pat >= beta {
+                return stand_pat;
+            }
+            if stand_pat > alpha {
+                alpha = stand_pat;
+            }
+        } else {
+            if stand_pat <= alpha {
+                return stand_pat;
+            }
+            if stand_pat < beta {
+                beta = stand_pat;
+            }
+        }
+
+        // 只考虑吃子着法，按 MVV-LVA 排序
+        let mut captures: Vec<ScoredMove> = Vec::new();
+        for mv in board.generate_pseudo_legal_moves(stm) {
+            let target = board.get_piece(mv.to_row, mv.to_col);
+            if target.is_empty() {
+                continue;
+            }
+            let mover = board.get_piece(mv.from_row, mv.from_col);
+            captures.push(ScoredMove {
+                mv,
+                score: target.value() * 8 - mover.value(),
+            });
+        }
+        captures.sort_by(|a, b| b.score.cmp(&a.score));
+
+        if maximizing_player {
+            let mut best = stand_pat;
+            for sm in &captures {
+                let undo = board.apply_move(&sm.mv);
+                let score = if in_check(&board.board, stm) {
+                    i32::MIN // 走完自己被将军，这步不算
+                } else {
+                    self.quiescence(board, ply + 1, qdepth - 1, alpha, beta, false)
+                };
+                board.undo_move(&sm.mv, &undo);
+                if score == i32::MIN {
+                    continue;
+                }
+                if score > best {
+                    best = score;
+                }
+                if best > alpha {
+                    alpha = best;
+                }
+                if alpha >= beta {
+                    break;
+                }
+            }
+            best
+        } else {
+            let mut best = stand_pat;
+            for sm in &captures {
+                let undo = board.apply_move(&sm.mv);
+                let score = if in_check(&board.board, stm) {
+                    i32::MAX
+                } else {
+                    self.quiescence(board, ply + 1, qdepth - 1, alpha, beta, true)
+                };
+                board.undo_move(&sm.mv, &undo);
+                if score == i32::MAX {
+                    continue;
+                }
+                if score < best {
+                    best = score;
+                }
+                if best < beta {
+                    beta = best;
+                }
+                if alpha >= beta {
+                    break;
+                }
+            }
+            best
         }
     }
 }
@@ -1998,6 +2446,7 @@ struct Game {
     game_log: Vec<String>,
     move_history: Vec<Move>,
     exited: bool,
+    end_reason: String,
 }
 
 impl Game {
@@ -2013,6 +2462,7 @@ impl Game {
             game_log: Vec::new(),
             move_history: Vec::new(),
             exited: false,
+            end_reason: String::new(),
         }
     }
 
@@ -2050,6 +2500,7 @@ impl Game {
     fn display_game_info(&self) {
         let cyan = gamekit::color::CYAN;
         let red = gamekit::color::RED;
+        let yellow = gamekit::color::YELLOW;
         let reset = gamekit::color::RESET;
         println!("{}=== 游戏信息 ==={}", cyan, reset);
         print!("游戏阶段: ");
@@ -2065,22 +2516,63 @@ impl Game {
         }
         let fifty_move_counter = self.board.get_fifty_move_counter();
         if fifty_move_counter >= 50 {
-            print!(" [50步规则: {}/100]", fifty_move_counter);
+            print!(" [50回合规则: {}/100]", fifty_move_counter);
         }
         if self.board.is_in_check(self.current_player) {
-            print!("{} [将军!]{}", red, cyan);
+            print!("{} [将军! 必须应将]{}", red, cyan);
         }
 
         let red_eval = self.board.evaluate(PieceColor::Red);
-        println!("\n局面评估: {}", if red_eval > 50 {
-            "红方优势".to_string()
-        } else if red_eval < -50 {
-            "黑方优势".to_string()
-        } else {
-            "均势".to_string()
-        });
+        println!(
+            "\n局面评估: {}",
+            if red_eval > 50 {
+                "红方优势".to_string()
+            } else if red_eval < -50 {
+                "黑方优势".to_string()
+            } else {
+                "均势".to_string()
+            }
+        );
         println!(" ({})", red_eval);
+
+        // 循环着法预警
+        if repetition_count >= 2 {
+            let (rk, bk) = self.board.analyze_repetition();
+            if rk != PerpetualKind::None || bk != PerpetualKind::None {
+                println!(
+                    "{}警告：循环着法 红{} / 黑{} —— 禁止着法方将判负！{}",
+                    yellow,
+                    rk.name(),
+                    bk.name(),
+                    reset
+                );
+            }
+        }
         println!("{}=== === === ==={}", cyan, reset);
+    }
+
+    fn print_rules(&self) {
+        let yellow = gamekit::color::YELLOW;
+        let reset = gamekit::color::RESET;
+        println!("{}\n中国象棋规则（本程序实现）:{}", yellow, reset);
+        println!(" 1. 红方先手，黑方后手。");
+        println!(" 2. 将/帅只能在九宫格内走一步（上下或左右）。");
+        println!(" 3. 士/仕只能在九宫格内斜走一步。");
+        println!(" 4. 象/相走田字且不蹩象眼，不能过河。");
+        println!(" 5. 马走日，蹩马腿不能走。");
+        println!(" 6. 车走直线，中间不能有子。");
+        println!(" 7. 炮走直线；吃子必须隔且仅隔一个子（炮架）。");
+        println!(" 8. 兵/卒过河前只能向前一步，过河后可左右走一步。");
+        println!(" 9. 飞将：将帅同列且中间无子时，可以直接吃掉对方将/帅。");
+        println!("10. 不允许走出“送将”的着法：走子后己方被将军（含照面）即为非法。");
+        println!("11. 被将军必须应将；无法应将（将死）判负。");
+        println!("12. 无着可走（困毙）同样判负。");
+        println!("13. 长将（循环中每步都将军）判负。");
+        println!("14. 长捉（循环中每步都由走动的子新造出吃子威胁）判负；");
+        println!("    双方均为禁止着法则判和。");
+        println!("15. 三次重复局面判和。");
+        println!("16. 连续 50 回合（100 步）无吃子且无兵卒移动判和。");
+        println!("17. 双方均无进攻子力（车马炮兵）判和。");
     }
 
     fn start(&mut self) {
@@ -2090,18 +2582,10 @@ impl Game {
 
         println!("{}========================================={}", magenta, reset);
         println!("{}  中国象棋游戏（增强AI版，避免送棋）{}", magenta, reset);
-        println!("{}  Rust 跨平台版 - 已修复移动敌方棋子问题{}", magenta, reset);
-        println!("{}========================================={}\n", magenta, reset);
+        println!("{}  Rust 跨平台版 - 完整规则版{}", magenta, reset);
+        println!("{}=========================================\n{}", magenta, reset);
 
-        println!("{}游戏规则说明:{}", yellow, reset);
-        println!("1. 红方先手，黑方后手");
-        println!("2. 将/帅只能在九宫格内移动");
-        println!("3. 特殊规则：'飞将' - 当将帅在同一直线上且中间无子时，可以直接吃掉对方将帅");
-        println!("4. 马走日，象走田，车走直线，炮隔山打牛");
-        println!("5. 兵/卒过河前只能前进，过河后可左右移动");
-        println!("6. 三次重复局面判和");
-        println!("7. 50回合未吃子且无兵移动判和");
-        println!("8. 双方无足够进攻子力判和");
+        self.print_rules();
         println!("{}=========================================\n{}", yellow, reset);
 
         // 选择游戏模式
@@ -2133,63 +2617,64 @@ impl Game {
 
         if self.red_is_ai || self.black_is_ai {
             println!("\n{}AI难度级别说明:{}", yellow, reset);
-            println!("1. 初级 - 简单启发式 (约1秒)");
-            println!("2. 中级 - Minimax搜索深度2 (约1秒)");
-            println!("3. 高级 - Minimax搜索深度3 (约1秒)");
-            println!("4. 专家 - 时间限制搜索深度4+ (约1秒)\n");
+            println!("1. 初级 - 简单启发式（不搜索）");
+            println!("2. 中级 - Alpha-Beta 搜索深度 2");
+            println!("3. 高级 - Alpha-Beta 搜索深度 3");
+            println!("4. 专家 - 迭代深化 + 静态搜索（约1秒）\n");
 
             if self.red_is_ai {
                 print!("{}选择红方AI难度 (1-4): {}", gamekit::color::RED, reset);
                 let _ = std::io::stdout().flush();
                 let d = read_int(4).unwrap_or(3);
-                if (1..=4).contains(&d) {
-                    self.set_ai_difficulty(PieceColor::Red, match d {
-                        1 => AIDifficulty::Level1,
-                        2 => AIDifficulty::Level2,
-                        3 => AIDifficulty::Level3,
-                        _ => AIDifficulty::Level4,
-                    });
-                }
+                self.set_ai_difficulty(PieceColor::Red, difficulty_from(d));
             }
             if self.black_is_ai {
                 print!("选择黑方AI难度 (1-4): ");
                 let _ = std::io::stdout().flush();
                 let d = read_int(4).unwrap_or(3);
-                if (1..=4).contains(&d) {
-                    self.set_ai_difficulty(PieceColor::Black, match d {
-                        1 => AIDifficulty::Level1,
-                        2 => AIDifficulty::Level2,
-                        3 => AIDifficulty::Level3,
-                        _ => AIDifficulty::Level4,
-                    });
-                }
+                self.set_ai_difficulty(PieceColor::Black, difficulty_from(d));
             }
         }
 
         println!("{}\n游戏开始！{}", gamekit::color::CYAN, reset);
 
         if mode == 2 {
-            println!("玩家: {}", if player_color == PieceColor::Red { "红方" } else { "黑方" });
+            println!(
+                "玩家: {}",
+                if player_color == PieceColor::Red {
+                    "红方"
+                } else {
+                    "黑方"
+                }
+            );
             let ai_diff = if player_color == PieceColor::Red {
                 self.black_ai_difficulty
             } else {
                 self.red_ai_difficulty
             };
-            println!("AI: {} (难度: {:?})", if player_color == PieceColor::Red { "黑方" } else { "红方" }, ai_diff as i32);
+            println!(
+                "AI: {} (难度: {})",
+                if player_color == PieceColor::Red {
+                    "黑方"
+                } else {
+                    "红方"
+                },
+                ai_diff as i32
+            );
         } else {
             println!(
-                "红方: {} (难度: {:?})",
+                "红方: {} (难度: {})",
                 if self.red_is_ai { "AI" } else { "玩家" },
                 self.red_ai_difficulty as i32
             );
             println!(
-                "黑方: {} (难度: {:?})",
+                "黑方: {} (难度: {})",
                 if self.black_is_ai { "AI" } else { "玩家" },
                 self.black_ai_difficulty as i32
             );
         }
 
-        println!("\n提示：输入99 0查看特殊命令\n");
+        println!("\n提示：输入 99 0 查看特殊命令\n");
 
         // 游戏主循环
         while self.state == GameState::Playing && !self.exited {
@@ -2203,7 +2688,7 @@ impl Game {
                 } else {
                     gamekit::color::GRAY
                 },
-                if self.current_player == PieceColor::Red { "红方" } else { "黑方" },
+                color_name(self.current_player),
                 reset
             );
 
@@ -2227,7 +2712,7 @@ impl Game {
                         self.black_ai_difficulty
                     },
                 );
-                mv = ai.get_best_move(&self.board);
+                mv = ai.get_best_move(&mut self.board);
                 let ai_duration = ai_start.elapsed();
 
                 if mv.is_placeholder() {
@@ -2237,6 +2722,7 @@ impl Game {
                     } else {
                         GameState::RedWin
                     };
+                    self.end_reason = format!("{}无着可走，判负", color_name(self.current_player));
                     break;
                 }
 
@@ -2255,7 +2741,9 @@ impl Game {
                 print!(" [评估节点: {}]", ai.get_nodes_evaluated());
 
                 let target_piece = self.board.get_piece(mv.to_row, mv.to_col);
-                if target_piece.ptype == PieceType::General && target_piece.color != self.current_player {
+                if target_piece.ptype == PieceType::General
+                    && target_piece.color != self.current_player
+                {
                     print!(" [飞将!]");
                 }
                 println!("\n{}", reset);
@@ -2284,18 +2772,18 @@ impl Game {
             let from_piece = self.board.get_piece(mv.from_row, mv.from_col);
             let to_piece = self.board.get_piece(mv.to_row, mv.to_col);
 
-            if self.board.move_piece(&mv, self.current_player) {
+            if self.board.make_move(&mv, self.current_player) {
                 self.move_history.push(mv);
 
                 let mut move_str = format!(
                     "{}: {},{} -> {},{}",
-                    if self.current_player == PieceColor::Red { "红方" } else { "黑方" },
+                    color_name(self.current_player),
                     mv.from_row,
                     mv.from_col,
                     mv.to_row,
                     mv.to_col
                 );
-                if to_piece.ptype != PieceType::Empty {
+                if !to_piece.is_empty() {
                     move_str.push_str(&format!(" 吃{}", to_piece.name()));
                 } else {
                     move_str.push_str(&format!(" 移动{}", from_piece.name()));
@@ -2305,36 +2793,45 @@ impl Game {
                 }
                 self.game_log.push(move_str);
 
+                // 交给对方走子，并按“待走子的一方”判定终局
+                self.current_player = opponent(self.current_player);
                 self.state = self.board.check_game_state(self.current_player);
 
                 if self.state == GameState::Draw {
-                    if self.board.is_threefold_repetition() {
-                        println!("{}三次重复局面，和棋！{}", yellow, reset);
-                    } else if self.board.is_fifty_move_rule_draw() {
-                        println!("{}50回合未吃子且无兵移动，和棋！{}", yellow, reset);
-                    } else if self.board.is_insufficient_material() {
-                        println!("{}双方无足够进攻子力，和棋！{}", yellow, reset);
-                    }
+                    self.end_reason = self.board.draw_reason();
+                    println!("{}{}{}", yellow, self.end_reason, reset);
                 } else if self.state != GameState::Playing {
                     let target_piece = self.board.get_piece(mv.to_row, mv.to_col);
-                    if target_piece.ptype == PieceType::General && target_piece.color != self.current_player {
+                    if target_piece.ptype == PieceType::General
+                        && target_piece.color != self.current_player
+                    {
                         println!("{}\n飞将成功！{}", magenta, reset);
                     }
+                    self.end_reason = self.board.win_reason(self.current_player);
+                    println!("{}{}{}", magenta, self.end_reason, reset);
                 }
-
-                self.current_player = if self.current_player == PieceColor::Red {
-                    PieceColor::Black
-                } else {
-                    PieceColor::Red
-                };
+            } else if self.board.is_pseudo_legal(&mv, self.current_player) {
+                // 走法本身没问题，只是走完之后自己被将军 / 将帅照面
+                println!(
+                    "{}非法移动：走完之后己方将帅仍被将军（或将帅照面），必须应将！{}",
+                    gamekit::color::RED,
+                    reset
+                );
             } else {
-                println!("{}非法移动，请重试！{}", gamekit::color::RED, reset);
+                println!(
+                    "{}非法移动：该棋子不能这样走，请重试！{}",
+                    gamekit::color::RED,
+                    reset
+                );
             }
         }
 
         // 显示游戏结果
         self.board.display();
         println!("{}\n游戏结束！{}", magenta, reset);
+        if !self.end_reason.is_empty() {
+            println!("结束原因: {}", self.end_reason);
+        }
         match self.state {
             GameState::RedWin => println!("红方获胜！"),
             GameState::BlackWin => println!("黑方获胜！"),
@@ -2349,8 +2846,11 @@ impl Game {
 
         println!("{}\n游戏统计:{}", gamekit::color::CYAN, reset);
         println!("总步数: {}", self.game_log.len());
-        println!("重复局面次数: {}", self.board.get_repetition_count());
-        println!("50步规则计数器: {}", self.board.get_fifty_move_counter());
+        println!("当前局面重复次数: {}", self.board.get_repetition_count());
+        println!(
+            "50回合规则计数器: {} / 100 步",
+            self.board.get_fifty_move_counter()
+        );
     }
 
     fn get_player_move(&self) -> Move {
@@ -2366,9 +2866,7 @@ impl Game {
             .chars()
             .map(|c| match c {
                 ',' | '，' => ' ',
-                '０'..='９' => {
-                    char::from_u32('0' as u32 + (c as u32 - '０' as u32)).unwrap_or(c)
-                }
+                '０'..='９' => char::from_u32('0' as u32 + (c as u32 - '０' as u32)).unwrap_or(c),
                 _ => c,
             })
             .collect();
@@ -2432,12 +2930,13 @@ impl Game {
                 for i in 0..10 {
                     for j in 0..9 {
                         let piece = self.board.board[i][j];
-                        if piece.ptype != PieceType::Empty {
-                            if piece.color == PieceColor::Red {
-                                red_pieces += 1;
-                            } else {
-                                black_pieces += 1;
-                            }
+                        if piece.is_empty() {
+                            continue;
+                        }
+                        if piece.color == PieceColor::Red {
+                            red_pieces += 1;
+                        } else {
+                            black_pieces += 1;
                         }
                     }
                 }
@@ -2455,6 +2954,7 @@ impl Game {
                 self.current_player = PieceColor::Red;
                 self.game_log.clear();
                 self.move_history.clear();
+                self.end_reason.clear();
                 println!("游戏已重新开始");
             }
             4 => {
@@ -2465,37 +2965,25 @@ impl Game {
                 if self.red_is_ai || self.black_is_ai {
                     println!("{}切换AI难度:{}", yellow, reset);
                     if self.red_is_ai {
-                        print!("红方AI当前难度: {:?}\n", self.red_ai_difficulty as i32);
+                        print!("红方AI当前难度: {}\n", self.red_ai_difficulty as i32);
                         print!("输入新难度 (1-4): ");
                         use std::io::Write;
                         let _ = std::io::stdout().flush();
-                        let difficulty = read_int(4).unwrap_or(3);
-                        if (1..=4).contains(&difficulty) {
-                            self.red_ai_difficulty = match difficulty {
-                                1 => AIDifficulty::Level1,
-                                2 => AIDifficulty::Level2,
-                                3 => AIDifficulty::Level3,
-                                _ => AIDifficulty::Level4,
-                            };
-                            println!("红方AI难度已设置为: {:?}", self.red_ai_difficulty as i32);
+                        if let Some(difficulty) = read_int(4) {
+                            self.red_ai_difficulty = difficulty_from(difficulty);
+                            println!("红方AI难度已设置为: {}", self.red_ai_difficulty as i32);
                         } else {
                             println!("无效的难度级别");
                         }
                     }
                     if self.black_is_ai {
-                        print!("黑方AI当前难度: {:?}\n", self.black_ai_difficulty as i32);
+                        print!("黑方AI当前难度: {}\n", self.black_ai_difficulty as i32);
                         print!("输入新难度 (1-4): ");
                         use std::io::Write;
                         let _ = std::io::stdout().flush();
-                        let difficulty = read_int(4).unwrap_or(3);
-                        if (1..=4).contains(&difficulty) {
-                            self.black_ai_difficulty = match difficulty {
-                                1 => AIDifficulty::Level1,
-                                2 => AIDifficulty::Level2,
-                                3 => AIDifficulty::Level3,
-                                _ => AIDifficulty::Level4,
-                            };
-                            println!("黑方AI难度已设置为: {:?}", self.black_ai_difficulty as i32);
+                        if let Some(difficulty) = read_int(4) {
+                            self.black_ai_difficulty = difficulty_from(difficulty);
+                            println!("黑方AI难度已设置为: {}", self.black_ai_difficulty as i32);
                         } else {
                             println!("无效的难度级别");
                         }
@@ -2505,70 +2993,77 @@ impl Game {
                 }
             }
             6 => {
-                println!("{}\n游戏规则说明:{}", yellow, reset);
-                println!("1. 红方先手，黑方后手");
-                println!("2. 将/帅只能在九宫格内移动");
-                println!("3. 特殊规则：'飞将' - 当将帅在同一直线上且中间无子时，可以直接吃掉对方将帅");
-                println!("4. 马走日，象走田，车走直线，炮隔山打牛");
-                println!("5. 兵/卒过河前只能前进，过河后可左右移动");
-                println!("6. 士/仕只能在九宫格内斜着移动");
-                println!("7. 象/相不能过河");
-                println!("8. 将军时，被将军方必须解除将军状态");
-                println!("9. 无法解除将军则判负");
-                println!("10. 三次重复局面判和");
-                println!("11. 50回合未吃子且无兵移动判和");
-                println!("12. 双方无足够进攻子力判和");
+                self.print_rules();
             }
             7 => {
                 println!("{}局面信息:{}", cyan, reset);
                 println!("当前局面重复次数: {}", self.board.get_repetition_count());
-                println!("50步规则计数器: {} / 100", self.board.get_fifty_move_counter());
+                println!(
+                    "50回合规则计数器: {} / 100 步",
+                    self.board.get_fifty_move_counter()
+                );
                 print!("游戏阶段: ");
                 match self.board.get_game_phase() {
                     GamePhase::Opening => println!("开局"),
                     GamePhase::Midgame => println!("中局"),
                     GamePhase::Endgame => println!("残局"),
                 }
+                if self.board.get_repetition_count() >= 2 {
+                    let (rk, bk) = self.board.analyze_repetition();
+                    println!("循环着法判定: 红{} / 黑{}", rk.name(), bk.name());
+                }
                 if self.board.is_threefold_repetition() {
                     println!("警告：已达到三次重复局面！");
                 }
                 if self.board.is_fifty_move_rule_draw() {
-                    println!("警告：已达到50回合未吃子且无兵移动！");
+                    println!("警告：已达到 50 回合无吃子且无兵卒移动！");
                 }
                 if self.board.is_insufficient_material() {
                     println!("警告：双方可能无足够进攻子力！");
                 }
+                if self.board.is_in_check(self.current_player) {
+                    println!("提示：{}正被将军，必须应将。", color_name(self.current_player));
+                }
             }
             8 => {
                 self.board.reset_position_history();
-                println!("{}局面历史已清空！{}", green, reset);
+                println!("{}局面历史已清空（重复/50回合计数归零）！{}", green, reset);
             }
             9 => {
                 println!("{}AI使用技术:{}", cyan, reset);
-                println!("1. Alpha-Beta剪枝优化");
-                println!("2. 启发式移动排序（避免送棋）");
-                println!("3. 静态交换评估（Quiescence Search）");
-                println!("4. 迭代深化搜索");
-                println!("5. 时间限制搜索");
-                println!("6. 增强的评估函数（安全性优先）");
-                println!("7. 局面哈希和重复检测");
-                println!("8. 棋子安全性评估");
-                println!("9. 棋子协调性评估");
-                println!("10. 兵/卒结构评估");
+                println!("1. Alpha-Beta 剪枝搜索");
+                println!("2. 启发式着法排序（MVV-LVA + 静态交换评估 SEE）");
+                println!("3. 静态搜索（Quiescence Search）");
+                println!("4. 迭代深化 + 时间限制搜索");
+                println!("5. 被将军时延伸搜索");
+                println!("6. 搜索路径重复局面识别（避免长将/重复）");
+                println!("7. 增强评估函数（子力 + 位置 + 安全 + 机动性）");
+                println!("8. Zobrist 局面哈希与重复检测");
+                println!("9. 完整规则校验：禁止自杀着法、将死/困毙、长将/长捉");
+                println!("10. 免送棋：选出着法后做 SEE 复核");
             }
             _ => println!("未知命令"),
         }
     }
 }
 
-/// 读取一个 1..=max 范围内的整数（读取失败或 EOF 返回 None）
+fn difficulty_from(d: i32) -> AIDifficulty {
+    match d {
+        1 => AIDifficulty::Level1,
+        2 => AIDifficulty::Level2,
+        3 => AIDifficulty::Level3,
+        _ => AIDifficulty::Level4,
+    }
+}
+
+/// 读取一个 1..=max 范围内的整数（越界或读取失败返回 None）
 fn read_int(max: i32) -> Option<i32> {
     let line = gamekit::read_line_cooked()?;
     let v = line.trim().parse::<i32>().ok()?;
     if (1..=max).contains(&v) {
         Some(v)
     } else {
-        Some(v)
+        None
     }
 }
 
@@ -2577,5 +3072,274 @@ fn main() {
     let mut game = Game::new();
     game.start();
 
-    println!("{}\n感谢游玩中国象棋增强AI版！{}", gamekit::color::MAGENTA, gamekit::color::RESET);
+    println!(
+        "{}\n感谢游玩中国象棋增强AI版！{}",
+        gamekit::color::MAGENTA,
+        gamekit::color::RESET
+    );
+}
+
+// ===========================================================================
+// 规则自测：cargo test -p chinese_chess
+// 覆盖自杀着法、将帅照面、将死、困毙、长将、长捉、三次重复、50 回合、
+// 炮/马/象/兵的走法细节与初始局面着法数。
+// ===========================================================================
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn empty_board() -> Board {
+        let mut b = Board::new();
+        b.board = [[Piece::new(); 9]; 10];
+        b.zobrist_hash = 0;
+        b.history.clear();
+        b.hash_history.clear();
+        b.position_history.clear();
+        b.fifty_move_rule_counter = 0;
+        b.repetition_count = 0;
+        b
+    }
+
+    fn put(b: &mut Board, r: i32, c: i32, t: PieceType, col: PieceColor) {
+        b.set_piece(r, c, Piece::with(t, col));
+    }
+
+    fn finish(b: &mut Board) {
+        b.zobrist_hash = b.compute_zobrist_hash();
+        b.reset_position_history();
+    }
+
+    #[test]
+    fn initial_position_has_44_legal_moves() {
+        let b = Board::new();
+        assert_eq!(b.get_all_legal_moves(PieceColor::Red).len(), 44);
+        assert_eq!(b.get_all_legal_moves(PieceColor::Black).len(), 44);
+    }
+
+    #[test]
+    fn suicide_move_is_illegal() {
+        let mut b = empty_board();
+        put(&mut b, 9, 4, PieceType::General, PieceColor::Red);
+        put(&mut b, 6, 0, PieceType::Soldier, PieceColor::Red);
+        put(&mut b, 5, 4, PieceType::Chariot, PieceColor::Black);
+        put(&mut b, 0, 5, PieceType::General, PieceColor::Black);
+        finish(&mut b);
+        assert!(b.is_in_check(PieceColor::Red));
+        assert!(!b.make_move(&Move::from_pos(6, 0, 5, 0), PieceColor::Red));
+        assert!(b.make_move(&Move::from_pos(9, 4, 9, 3), PieceColor::Red));
+    }
+
+    #[test]
+    fn creating_facing_generals_is_illegal() {
+        let mut b = empty_board();
+        put(&mut b, 9, 4, PieceType::General, PieceColor::Red);
+        put(&mut b, 5, 4, PieceType::Chariot, PieceColor::Red);
+        put(&mut b, 0, 4, PieceType::General, PieceColor::Black);
+        finish(&mut b);
+        assert!(!b.is_in_check(PieceColor::Red));
+        assert!(!b.make_move(&Move::from_pos(5, 4, 5, 0), PieceColor::Red));
+    }
+
+    #[test]
+    fn flying_general_capture() {
+        let mut b = empty_board();
+        put(&mut b, 9, 4, PieceType::General, PieceColor::Red);
+        put(&mut b, 0, 4, PieceType::General, PieceColor::Black);
+        finish(&mut b);
+        assert!(b.is_in_check(PieceColor::Black));
+        assert!(b.is_in_check(PieceColor::Red));
+        assert!(b.make_move(&Move::from_pos(9, 4, 0, 4), PieceColor::Red));
+        assert_eq!(b.check_game_state(PieceColor::Black), GameState::RedWin);
+    }
+
+    #[test]
+    fn checkmate_is_detected() {
+        // 红帅(9,4) 孤帅，(8,4)(9,3)(9,5) 全被黑车控制 -> 将死
+        let mut b = empty_board();
+        put(&mut b, 9, 4, PieceType::General, PieceColor::Red);
+        put(&mut b, 0, 4, PieceType::Chariot, PieceColor::Black);
+        put(&mut b, 9, 0, PieceType::Chariot, PieceColor::Black);
+        put(&mut b, 9, 8, PieceType::Chariot, PieceColor::Black);
+        put(&mut b, 0, 3, PieceType::General, PieceColor::Black);
+        finish(&mut b);
+        assert!(b.is_in_check(PieceColor::Red));
+        assert!(b.get_all_legal_moves(PieceColor::Red).is_empty());
+        assert_eq!(b.check_game_state(PieceColor::Red), GameState::BlackWin);
+        assert!(b.win_reason(PieceColor::Red).contains("将死"));
+    }
+
+    #[test]
+    fn stalemate_is_loss() {
+        // 红帅(7,4) 孤立，(8,4)(7,3)(7,5) 均被黑马控制，但 (7,4) 未被攻击 -> 困毙
+        let mut b = empty_board();
+        put(&mut b, 7, 4, PieceType::General, PieceColor::Red);
+        put(&mut b, 6, 3, PieceType::Horse, PieceColor::Black);
+        put(&mut b, 5, 2, PieceType::Horse, PieceColor::Black);
+        put(&mut b, 0, 3, PieceType::General, PieceColor::Black);
+        finish(&mut b);
+        assert!(!b.is_in_check(PieceColor::Red));
+        assert!(b.get_all_legal_moves(PieceColor::Red).is_empty());
+        assert_eq!(b.check_game_state(PieceColor::Red), GameState::BlackWin);
+        assert!(b.win_reason(PieceColor::Red).contains("困毙"));
+    }
+
+    #[test]
+    fn perpetual_check_loses() {
+        // 红车(2,3)<->(2,4) 反复照将黑将(0,4)<->(0,3)
+        let mut b = empty_board();
+        put(&mut b, 9, 5, PieceType::General, PieceColor::Red);
+        put(&mut b, 2, 3, PieceType::Chariot, PieceColor::Red);
+        put(&mut b, 0, 4, PieceType::General, PieceColor::Black);
+        finish(&mut b);
+
+        let cycle = [
+            (PieceColor::Red, 2, 3, 2, 4),
+            (PieceColor::Black, 0, 4, 0, 3),
+            (PieceColor::Red, 2, 4, 2, 3),
+            (PieceColor::Black, 0, 3, 0, 4),
+        ];
+        for _ in 0..2 {
+            for &(side, fr, fc, tr, tc) in &cycle {
+                assert!(b.make_move(&Move::from_pos(fr, fc, tr, tc), side));
+                if side == PieceColor::Red {
+                    assert!(b.is_in_check(PieceColor::Black));
+                }
+            }
+        }
+        assert_eq!(b.get_repetition_count(), 3);
+        let (rk, bk) = b.analyze_repetition();
+        assert_eq!(rk, PerpetualKind::Check);
+        assert_eq!(bk, PerpetualKind::None);
+        assert_eq!(b.check_game_state(PieceColor::Red), GameState::BlackWin);
+        assert!(b.win_reason(PieceColor::Red).contains("长将"));
+    }
+
+    #[test]
+    fn threefold_repetition_without_offence_is_draw() {
+        let mut b = empty_board();
+        put(&mut b, 9, 4, PieceType::General, PieceColor::Red);
+        put(&mut b, 5, 0, PieceType::Chariot, PieceColor::Red);
+        put(&mut b, 0, 3, PieceType::General, PieceColor::Black);
+        put(&mut b, 4, 8, PieceType::Chariot, PieceColor::Black);
+        finish(&mut b);
+
+        let cycle = [
+            (PieceColor::Red, 5, 0, 5, 1),
+            (PieceColor::Black, 4, 8, 4, 7),
+            (PieceColor::Red, 5, 1, 5, 0),
+            (PieceColor::Black, 4, 7, 4, 8),
+        ];
+        for _ in 0..2 {
+            for &(side, fr, fc, tr, tc) in &cycle {
+                assert!(b.make_move(&Move::from_pos(fr, fc, tr, tc), side));
+            }
+        }
+        assert_eq!(b.get_repetition_count(), 3);
+        let (rk, bk) = b.analyze_repetition();
+        assert_eq!(rk, PerpetualKind::None);
+        assert_eq!(bk, PerpetualKind::None);
+        assert_eq!(b.check_game_state(PieceColor::Red), GameState::Draw);
+        assert!(b.draw_reason().contains("三次重复"));
+    }
+
+    #[test]
+    fn perpetual_chase_loses() {
+        // 红车在 (0,4)<->(0,5) 反复捉无保护的黑卒 (5,4)<->(5,5)
+        let mut b = empty_board();
+        put(&mut b, 9, 4, PieceType::General, PieceColor::Red);
+        put(&mut b, 0, 4, PieceType::Chariot, PieceColor::Red);
+        put(&mut b, 2, 3, PieceType::General, PieceColor::Black);
+        put(&mut b, 5, 4, PieceType::Soldier, PieceColor::Black);
+        finish(&mut b);
+
+        let cycle = [
+            (PieceColor::Black, 5, 4, 5, 5),
+            (PieceColor::Red, 0, 4, 0, 5),
+            (PieceColor::Black, 5, 5, 5, 4),
+            (PieceColor::Red, 0, 5, 0, 4),
+        ];
+        for _ in 0..2 {
+            for &(side, fr, fc, tr, tc) in &cycle {
+                assert!(b.make_move(&Move::from_pos(fr, fc, tr, tc), side));
+                assert!(!b.is_in_check(PieceColor::Black));
+            }
+        }
+        assert_eq!(b.get_repetition_count(), 3);
+        let (rk, bk) = b.analyze_repetition();
+        assert_eq!(rk, PerpetualKind::Chase);
+        assert_eq!(bk, PerpetualKind::None);
+        assert_eq!(b.check_game_state(PieceColor::Black), GameState::BlackWin);
+        assert!(b.win_reason(PieceColor::Black).contains("长捉"));
+    }
+
+    #[test]
+    fn fifty_move_counter_and_reset() {
+        let mut b = empty_board();
+        put(&mut b, 9, 4, PieceType::General, PieceColor::Red);
+        put(&mut b, 5, 0, PieceType::Chariot, PieceColor::Red);
+        put(&mut b, 0, 3, PieceType::General, PieceColor::Black);
+        put(&mut b, 4, 8, PieceType::Chariot, PieceColor::Black);
+        finish(&mut b);
+
+        let cycle = [
+            (PieceColor::Red, 5, 0, 5, 1),
+            (PieceColor::Black, 4, 8, 4, 7),
+            (PieceColor::Red, 5, 1, 5, 0),
+            (PieceColor::Black, 4, 7, 4, 8),
+        ];
+        for i in 0..100 {
+            let (side, fr, fc, tr, tc) = cycle[i % 4];
+            assert!(b.make_move(&Move::from_pos(fr, fc, tr, tc), side));
+        }
+        assert_eq!(b.get_fifty_move_counter(), 100);
+        assert!(b.is_fifty_move_rule_draw());
+
+        let mut b2 = empty_board();
+        put(&mut b2, 9, 4, PieceType::General, PieceColor::Red);
+        put(&mut b2, 5, 0, PieceType::Chariot, PieceColor::Red);
+        put(&mut b2, 0, 3, PieceType::General, PieceColor::Black);
+        put(&mut b2, 5, 6, PieceType::Horse, PieceColor::Black);
+        finish(&mut b2);
+        assert!(b2.make_move(&Move::from_pos(5, 0, 5, 1), PieceColor::Red));
+        assert_eq!(b2.get_fifty_move_counter(), 1);
+        assert!(b2.make_move(&Move::from_pos(5, 1, 5, 6), PieceColor::Red));
+        assert_eq!(b2.get_fifty_move_counter(), 0);
+    }
+
+    #[test]
+    fn piece_movement_rules() {
+        let mut b = empty_board();
+        put(&mut b, 9, 4, PieceType::General, PieceColor::Red);
+        put(&mut b, 0, 3, PieceType::General, PieceColor::Black);
+        // 炮A(7,0)：无炮架不能吃 (7,3) 的黑马，但可平移到 (7,1)
+        put(&mut b, 7, 1, PieceType::Cannon, PieceColor::Red);
+        put(&mut b, 7, 3, PieceType::Horse, PieceColor::Black);
+        // 炮B(2,0)：隔 (2,3) 己方兵可吃 (2,6) 黑马；不能落在隔着一子的空格 (2,4)
+        put(&mut b, 2, 0, PieceType::Cannon, PieceColor::Red);
+        put(&mut b, 2, 3, PieceType::Soldier, PieceColor::Red);
+        put(&mut b, 2, 6, PieceType::Horse, PieceColor::Black);
+        // 马(7,7) 蹩腿
+        put(&mut b, 7, 7, PieceType::Horse, PieceColor::Red);
+        put(&mut b, 8, 7, PieceType::Soldier, PieceColor::Red);
+        // 象(9,2) 塞象眼
+        put(&mut b, 9, 2, PieceType::Elephant, PieceColor::Red);
+        put(&mut b, 8, 3, PieceType::Soldier, PieceColor::Red);
+        // 兵/卒过河与否
+        put(&mut b, 4, 4, PieceType::Soldier, PieceColor::Red);
+        put(&mut b, 3, 4, PieceType::Soldier, PieceColor::Black);
+        finish(&mut b);
+
+        assert!(!b.is_move_legal(7, 1, 7, 3)); // 炮无炮架不能吃
+        assert!(b.is_move_legal(7, 1, 7, 0)); // 炮无炮架可平移
+        assert!(b.is_move_legal(2, 0, 2, 6)); // 炮隔一子可吃
+        assert!(!b.is_move_legal(2, 0, 2, 4)); // 炮不能落在隔子后的空格
+        assert!(b.is_move_legal(2, 0, 2, 1)); // 炮可平移到空格
+        assert!(!b.is_move_legal(7, 7, 9, 6)); // 蹩马腿
+        assert!(b.is_move_legal(7, 7, 5, 6)); // 另一方向无阻 -> 合法
+        assert!(!b.is_move_legal(9, 2, 7, 4)); // 塞象眼
+        assert!(b.is_move_legal(9, 2, 7, 0)); // 另一方向未塞眼 -> 合法
+        assert!(b.is_move_legal(4, 4, 4, 5)); // 过河兵可横走
+        assert!(!b.is_move_legal(3, 4, 3, 5)); // 未过河卒不可横走
+        assert!(b.is_move_legal(3, 4, 4, 4)); // 未过河卒可直进
+    }
 }
