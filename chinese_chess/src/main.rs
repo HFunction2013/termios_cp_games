@@ -769,6 +769,53 @@ fn see_capture(a: &mut Grid, row: i32, col: i32, side: PieceColor) -> i32 {
     }
 }
 
+/// 走完这一步之后，mover 是否构成“捉”。
+///
+/// `before` + `mv` 唯一确定走完之后的局面，所以只传入「走之前的棋盘快照」即可复算。
+/// 这样搜索时对路径上的历史节点也能判定长捉，而无需保存整条棋盘快照链。
+///
+/// 判定标准（对应象棋规则里的“走子攻击”）：
+/// 1. 被攻击的是对方将/帅以外的棋子；
+/// 2. 该威胁必须是**这一步新造出来的** —— 由走动的那枚棋子发起，
+///    且它在走之前并没有攻击这个目标；
+///    （这样可以排除“走之前就已存在的静态威胁”，避免把普通循环着法误判成长捉）
+/// 3. 威胁成立：目标无保护（有保护的棋子对方无需应对，不构成真正的“捉”）。
+fn is_chasing_move(before: &Grid, mover: PieceColor, mv: &Move) -> bool {
+    let moved = g_get(before, mv.from_row, mv.from_col);
+    if moved.is_empty() || moved.ptype == PieceType::General {
+        return false; // 将/帅本身不构成“捉”
+    }
+    // 由 before + mv 重建走完之后的棋盘
+    let mut after = *before;
+    g_set(&mut after, mv.to_row, mv.to_col, moved);
+    g_set(&mut after, mv.from_row, mv.from_col, Piece::new());
+
+    let opp = opponent(mover);
+    for r in 0..10i32 {
+        for c in 0..9i32 {
+            let target = g_get(&after, r, c);
+            if target.is_empty() || target.color != opp {
+                continue;
+            }
+            if target.ptype == PieceType::General {
+                continue;
+            }
+            // 必须是“走动的那枚棋子”发起的攻击
+            if !move_legal(&after, mv.to_row, mv.to_col, r, c) {
+                continue;
+            }
+            // 走之前它就已经在攻击这个目标 -> 不是新威胁
+            if move_legal(before, mv.from_row, mv.from_col, r, c) {
+                continue;
+            }
+            if !square_protected(&after, r, c, opp) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// 走某一步之后的静态交换评估（可为负：代表这步会白丢子）
 fn see_move(a: &Grid, mv: &Move, color: PieceColor) -> i32 {
     let mut scratch = *a;
@@ -1047,7 +1094,7 @@ impl Board {
 
         let opp = opponent(current_player);
         let gave_check = in_check(&self.board, opp);
-        let chasing = self.is_chasing(current_player, mv, &before);
+        let chasing = is_chasing_move(&before, current_player, mv);
         let moved = self.get_piece(mv.to_row, mv.to_col);
         let is_capture = !undo.captured.is_empty();
         let is_soldier = moved.ptype == PieceType::Soldier;
@@ -1081,45 +1128,6 @@ impl Board {
         });
         self.record_position();
         true
-    }
-
-    /// 走完这一步之后，mover 是否构成“捉”。
-    ///
-    /// 判定标准（对应象棋规则里的“走子攻击”）：
-    /// 1. 被攻击的是对方将/帅以外的棋子；
-    /// 2. 该威胁必须是**这一步新造出来的** —— 由走动的那枚棋子发起，
-    ///    且它在走之前并没有攻击这个目标；
-    ///    （这样可以排除“走之前就已经存在的静态威胁”，避免把普通循环着法误判成长捉）
-    /// 3. 威胁成立：目标无保护（有保护的棋子对方无需应对，不构成真正的“捉”）。
-    fn is_chasing(&self, mover: PieceColor, mv: &Move, before: &Grid) -> bool {
-        let opp = opponent(mover);
-        let moved = g_get(&self.board, mv.to_row, mv.to_col);
-        if moved.is_empty() || moved.ptype == PieceType::General {
-            return false; // 将/帅本身不构成“捉”
-        }
-        for r in 0..10i32 {
-            for c in 0..9i32 {
-                let target = g_get(&self.board, r, c);
-                if target.is_empty() || target.color != opp {
-                    continue;
-                }
-                if target.ptype == PieceType::General {
-                    continue;
-                }
-                // 必须是“走动的那枚棋子”发起的攻击
-                if !move_legal(&self.board, mv.to_row, mv.to_col, r, c) {
-                    continue;
-                }
-                // 走之前它就已经在攻击这个目标 -> 不是新威胁
-                if move_legal(before, mv.from_row, mv.from_col, r, c) {
-                    continue;
-                }
-                if !square_protected(&self.board, r, c, opp) {
-                    return true;
-                }
-            }
-        }
-        false
     }
 
     fn is_move_legal(&self, from_row: i32, from_col: i32, to_row: i32, to_col: i32) -> bool {
@@ -1332,7 +1340,19 @@ impl Board {
     }
 
     /// 回溯“当前局面首次出现”以来的整个循环，给出双方的循环着法定性
+    /// 循环着法定性（最终裁决用：要求真正形成三次重复局面）
     fn analyze_repetition(&self) -> (PerpetualKind, PerpetualKind) {
+        self.analyze_cycle(true)
+    }
+
+    /// `require_three = true`：要求三次重复成立，用于终局裁决。
+    /// `require_three = false`：局面只要已重复出现就定性，供 AI 提前预判
+    /// “再这么走下去自己会不会被判长将 / 长捉”——让 AI 不必等到循环走完才察觉。
+    fn analyze_cycle(&self, require_three: bool) -> (PerpetualKind, PerpetualKind) {
+        // 少了“三次重复”这个前提，单步或两步的“循环”会被误判成长将 / 长捉
+        if require_three && self.repetition_count < 3 {
+            return (PerpetualKind::None, PerpetualKind::None);
+        }
         let current = self.zobrist_hash;
         let start = match self.hash_history.iter().position(|&h| h == current) {
             Some(i) => i,
@@ -1340,7 +1360,16 @@ impl Board {
         };
         // history[i] 是把 hash_history[i] 变成 hash_history[i+1] 的那一步
         let cycle = &self.history[start..];
+        // 循环里不能有不可逆着法，且双方都必须走过子
         if cycle.is_empty() || cycle.iter().any(|e| e.irreversible) {
+            return (PerpetualKind::None, PerpetualKind::None);
+        }
+        // 裁决要求一个完整来回（4 步）；预判放宽到双方各一步即可
+        let min_len = if require_three { 4 } else { 2 };
+        if cycle.len() < min_len
+            || !cycle.iter().any(|e| e.mover == PieceColor::Red)
+            || !cycle.iter().any(|e| e.mover == PieceColor::Black)
+        {
             return (PerpetualKind::None, PerpetualKind::None);
         }
 
@@ -1429,55 +1458,56 @@ impl Board {
         red_attack == 0 && black_attack == 0
     }
 
+    /// 终局原因文案。判定顺序必须与 `check_game_state` 完全一致，
+    /// 否则会出现“判负原因”和“胜负结果”互相矛盾的情况。
     fn win_reason(&self, side_to_move: PieceColor) -> String {
+        // 1. 将帅存亡
         if !self.has_general(PieceColor::Red) {
             return "红帅被吃".to_string();
         }
         if !self.has_general(PieceColor::Black) {
             return "黑将被吃".to_string();
         }
+        // 2. 将死 / 困毙（优先于重复局面）
+        if self.get_all_legal_moves(side_to_move).is_empty() {
+            let name = color_name(side_to_move);
+            return if self.is_in_check(side_to_move) {
+                format!("{}被将死", name)
+            } else {
+                format!("{}无着可走（困毙），判负", name)
+            };
+        }
+        // 3. 循环着法：长将 / 长捉
+        if self.is_threefold_repetition() {
+            return self.perpetual_reason();
+        }
+        format!("{}获胜", color_name(opponent(side_to_move)))
+    }
+
+    /// 三次重复局面下的循环着法裁决文案
+    fn perpetual_reason(&self) -> String {
         let (red_kind, black_kind) = self.analyze_repetition();
         match (red_kind, black_kind) {
-            (PerpetualKind::None, PerpetualKind::None) => {}
-            (_, PerpetualKind::None) => {
-                return format!("红方{}，属禁止着法，判负", red_kind.name());
-            }
-            (PerpetualKind::None, _) => {
-                return format!("黑方{}，属禁止着法，判负", black_kind.name());
-            }
-            (_, _) => {
-                return format!(
-                    "双方循环着法均属禁止着法（红{} / 黑{}），判和",
-                    red_kind.name(),
-                    black_kind.name()
-                );
-            }
-        }
-        let name = color_name(side_to_move);
-        if self.is_in_check(side_to_move) {
-            format!("{}被将死", name)
-        } else {
-            format!("{}无着可走（困毙）", name)
+            (PerpetualKind::None, PerpetualKind::None) => "三次重复局面，判和".to_string(),
+            (_, PerpetualKind::None) => format!("红方{}，属禁止着法，判负", red_kind.name()),
+            (PerpetualKind::None, _) => format!("黑方{}，属禁止着法，判负", black_kind.name()),
+            (_, _) => format!(
+                "双方循环着法均属禁止着法（红{} / 黑{}），判和",
+                red_kind.name(),
+                black_kind.name()
+            ),
         }
     }
 
     fn draw_reason(&self) -> String {
-        let (red_kind, black_kind) = self.analyze_repetition();
-        if red_kind != PerpetualKind::None && black_kind != PerpetualKind::None {
-            return format!(
-                "双方循环着法均属禁止着法（红{} / 黑{}），判和",
-                red_kind.name(),
-                black_kind.name()
-            );
-        }
         if self.is_threefold_repetition() {
-            return "三次重复局面，判和".to_string();
+            return self.perpetual_reason();
         }
         if self.is_fifty_move_rule_draw() {
             return "连续 50 回合（100 步）无吃子且无兵卒移动，判和".to_string();
         }
         if self.is_insufficient_material() {
-            return "双方均无足够进攻子力，判和".to_string();
+            return "双方均无足够进攻子力（车马炮兵），判和".to_string();
         }
         "和棋".to_string()
     }
@@ -1819,6 +1849,19 @@ struct ScoredMove {
 
 const MATE_SCORE: i32 = 100_000;
 
+/// 搜索路径上的一个节点（用于识别重复局面与循环着法）
+struct SearchNode {
+    /// 走完这一步之后的局面哈希
+    hash: u64,
+    /// 走这一步的一方
+    mover: PieceColor,
+    mv: Move,
+    /// 走完这一步是否将军对方（长将判定的依据，几乎零成本）
+    gave_check: bool,
+    /// 走这一步之前的棋盘快照（配合 mv 即可复算“捉”）
+    before: Grid,
+}
+
 struct AI {
     color: PieceColor,
     difficulty: AIDifficulty,
@@ -1826,8 +1869,8 @@ struct AI {
     max_search_time: Duration,
     start_time: Instant,
     timeout: bool,
-    /// 搜索路径上的局面哈希，用于搜索内部识别重复局面
-    search_path: Vec<u64>,
+    /// 搜索路径上的节点，用于在搜索内部识别重复局面与长将 / 长捉
+    search_nodes: Vec<SearchNode>,
 }
 
 impl AI {
@@ -1839,15 +1882,21 @@ impl AI {
             max_search_time: Duration::from_millis(1000),
             start_time: Instant::now(),
             timeout: false,
-            search_path: Vec::new(),
+            search_nodes: Vec::new(),
         }
     }
 
     fn get_best_move(&mut self, board: &mut Board) -> Move {
         self.nodes_evaluated = 0;
         self.timeout = false;
-        self.search_path.clear();
-        self.search_path.push(board.zobrist_hash);
+        self.search_nodes.clear();
+        self.search_nodes.push(SearchNode {
+            hash: board.zobrist_hash,
+            mover: self.color,
+            mv: Move::new(),
+            gave_check: false,
+            before: board.board,
+        });
         self.start_time = Instant::now();
 
         // 原版四个难度统一 1000ms
@@ -1865,9 +1914,12 @@ impl AI {
 
         let mut best_move = match self.difficulty {
             AIDifficulty::Level1 => self.get_smart_heuristic_move(board, &legal_moves),
-            AIDifficulty::Level2 => self.search_root(board, &legal_moves, 2),
-            AIDifficulty::Level3 => self.search_root(board, &legal_moves, 3),
-            AIDifficulty::Level4 => self.iterative_deepening(board, &legal_moves, 6),
+            // 循环着法（长将 / 长捉）至少要 4 步才成立，搜索深度必须 >= 4
+            // AI 才能在搜索里看见并回避；所以三档都用迭代深化把 1 秒用满，
+            // 只有最大深度不同（越深越能看到更长的循环）。
+            AIDifficulty::Level2 => self.iterative_deepening(board, &legal_moves, 4),
+            AIDifficulty::Level3 => self.iterative_deepening(board, &legal_moves, 6),
+            AIDifficulty::Level4 => self.iterative_deepening(board, &legal_moves, 8),
         };
 
         // 未找到好着法时使用启发式
@@ -1886,11 +1938,28 @@ impl AI {
             }
         }
 
+        // 规则闸门：绝不能走出让自己因长将 / 长捉被判负的着法
+        if self.would_self_forfeit(board, &best_move) {
+            let mut candidates: Vec<ScoredMove> = legal_moves
+                .iter()
+                .filter(|m| !self.would_self_forfeit(board, m))
+                .map(|&m| ScoredMove {
+                    mv: m,
+                    score: self.evaluate_move_safety(board, &m),
+                })
+                .collect();
+            candidates.sort_by(|a, b| b.score.cmp(&a.score));
+            if let Some(c) = candidates.first() {
+                best_move = c.mv;
+                best_move.score = c.score;
+            }
+        }
+
         // 安全检查：若选出的着法会白丢子，换成不吃亏的最佳着法
         if !self.is_move_safe(board, &best_move) {
             let mut candidates: Vec<ScoredMove> = legal_moves
                 .iter()
-                .filter(|m| self.is_move_safe(board, m))
+                .filter(|m| self.is_move_safe(board, m) && !self.would_self_forfeit(board, m))
                 .map(|&m| ScoredMove {
                     mv: m,
                     score: self.evaluate_move_safety(board, &m),
@@ -1904,6 +1973,28 @@ impl AI {
         }
 
         best_move
+    }
+
+    /// 走这一步会不会让自己因长将 / 长捉被判负。
+    /// 用真实棋盘历史模拟一次，只在根节点对候选着法调用。
+    ///
+    /// 局面只要已重复出现就开始预判，不必等三次重复真正成立——
+    /// 这样即便搜索深度不够、看不到完整循环，AI 也不会一步步走进违规。
+    fn would_self_forfeit(&self, board: &Board, mv: &Move) -> bool {
+        let mut sim = board.clone();
+        if !sim.make_move(mv, self.color) {
+            return false;
+        }
+        if sim.get_repetition_count() < 2 {
+            return false;
+        }
+        let (red_kind, black_kind) = sim.analyze_cycle(false);
+        match self.color {
+            PieceColor::Red => {
+                red_kind != PerpetualKind::None && black_kind == PerpetualKind::None
+            }
+            _ => black_kind != PerpetualKind::None && red_kind == PerpetualKind::None,
+        }
     }
 
     #[allow(dead_code)]
@@ -2115,6 +2206,8 @@ impl AI {
         v
     }
 
+    /// 单轮根搜索（iterative_deepening 会按深度反复调用）
+    #[allow(dead_code)]
     fn search_root(&mut self, board: &mut Board, moves: &[Move], depth: i32) -> Move {
         if moves.is_empty() || depth <= 0 {
             return self.get_smart_heuristic_move(board, moves);
@@ -2128,15 +2221,20 @@ impl AI {
             if self.check_timeout() && best_score > i32::MIN {
                 break;
             }
+            let before = board.board;
             let undo = board.apply_move(&sm.mv);
-            let score = if self.is_repetition(board) {
-                0
-            } else {
-                self.search_path.push(board.zobrist_hash);
-                let s = self.alphabeta(board, depth - 1, 1, false, alpha, i32::MAX);
-                self.search_path.pop();
-                s
+            self.search_nodes.push(SearchNode {
+                hash: board.zobrist_hash,
+                mover: self.color,
+                mv: sm.mv,
+                gave_check: in_check(&board.board, opponent(self.color)),
+                before,
+            });
+            let score = match self.repetition_value(1) {
+                Some(v) => v,
+                None => self.alphabeta(board, depth - 1, 1, false, alpha, i32::MAX),
             };
+            self.search_nodes.pop();
             board.undo_move(&sm.mv, &undo);
 
             if score > best_score {
@@ -2169,15 +2267,20 @@ impl AI {
                     completed = false;
                     break;
                 }
+                let before = board.board;
                 let undo = board.apply_move(&sm.mv);
-                let score = if self.is_repetition(board) {
-                    0
-                } else {
-                    self.search_path.push(board.zobrist_hash);
-                    let s = self.alphabeta(board, depth - 1, 1, false, alpha, i32::MAX);
-                    self.search_path.pop();
-                    s
+                self.search_nodes.push(SearchNode {
+                    hash: board.zobrist_hash,
+                    mover: self.color,
+                    mv: sm.mv,
+                    gave_check: in_check(&board.board, opponent(self.color)),
+                    before,
+                });
+                let score = match self.repetition_value(1) {
+                    Some(v) => v,
+                    None => self.alphabeta(board, depth - 1, 1, false, alpha, i32::MAX),
                 };
+                self.search_nodes.pop();
                 board.undo_move(&sm.mv, &undo);
 
                 if score > cur_score {
@@ -2203,9 +2306,81 @@ impl AI {
         best_move
     }
 
-    /// 当前局面是否已在搜索路径上出现过（重复局面按和棋处理）
-    fn is_repetition(&self, board: &Board) -> bool {
-        self.search_path.contains(&board.zobrist_hash)
+    /// 若当前局面已在搜索路径上出现过，直接给出该局面的估值：
+    /// 构成长将 / 长捉的一方判负，双方都违规或都合规则判和（0 分）。
+    /// 返回 None 表示未重复，需要继续正常展开。
+    ///
+    /// 这是让 AI 主动回避违规着法的关键：走长将会在几步之内触发重复
+    /// 并拿到判负分，搜索自然会改挑别的着法。
+    fn repetition_value(&self, ply: i32) -> Option<i32> {
+        // 调用前刚走过的那一步已经入栈，它是循环的最后一环
+        let last = self.search_nodes.len().checked_sub(1)?;
+        let cur_hash = self.search_nodes[last].hash;
+        // 只在「这一步之前」的历史里查找，否则 position 会先匹配到自己
+        let start = self.search_nodes[..last].iter().position(|n| n.hash == cur_hash)?;
+        // 从「第一次到达该局面之后的那一步」起，到「刚走的这一步」为止，才是真正的循环。
+        // 直接用 search_nodes[start..] 会把循环外的那一步也算进来。
+        let cycle = &self.search_nodes[start + 1..];
+        // 双方各走一步才算一个完整来回（4 步即该局面第 3 次出现）
+        if cycle.len() < 4 {
+            return Some(0);
+        }
+
+        let (mut rm, mut rc, mut rz) = (0i32, 0i32, 0i32);
+        let (mut bm, mut bc, mut bz) = (0i32, 0i32, 0i32);
+        for n in cycle {
+            if n.mover == PieceColor::Red {
+                rm += 1;
+                if n.gave_check {
+                    rc += 1;
+                }
+                if is_chasing_move(&n.before, PieceColor::Red, &n.mv) {
+                    rz += 1;
+                }
+            } else {
+                bm += 1;
+                if n.gave_check {
+                    bc += 1;
+                }
+                if is_chasing_move(&n.before, PieceColor::Black, &n.mv) {
+                    bz += 1;
+                }
+            }
+        }
+
+        let red_kind = if rm > 0 && rc == rm {
+            PerpetualKind::Check
+        } else if rm > 0 && rz == rm {
+            PerpetualKind::Chase
+        } else {
+            PerpetualKind::None
+        };
+        let black_kind = if bm > 0 && bc == bm {
+            PerpetualKind::Check
+        } else if bm > 0 && bz == bm {
+            PerpetualKind::Chase
+        } else {
+            PerpetualKind::None
+        };
+
+        Some(match (red_kind, black_kind) {
+            (PerpetualKind::None, PerpetualKind::None) => 0,
+            (_, PerpetualKind::None) => {
+                if self.color == PieceColor::Red {
+                    -(MATE_SCORE - ply)
+                } else {
+                    MATE_SCORE - ply
+                }
+            }
+            (PerpetualKind::None, _) => {
+                if self.color == PieceColor::Black {
+                    -(MATE_SCORE - ply)
+                } else {
+                    MATE_SCORE - ply
+                }
+            }
+            (_, _) => 0,
+        })
     }
 
     fn alphabeta(
@@ -2272,15 +2447,20 @@ impl AI {
         if maximizing_player {
             let mut max_eval = i32::MIN;
             for sm in &scored_moves {
+                let before = board.board;
                 let undo = board.apply_move(&sm.mv);
-                let eval = if self.is_repetition(board) {
-                    0
-                } else {
-                    self.search_path.push(board.zobrist_hash);
-                    let s = self.alphabeta(board, d - 1, ply + 1, false, alpha, beta);
-                    self.search_path.pop();
-                    s
+                self.search_nodes.push(SearchNode {
+                    hash: board.zobrist_hash,
+                    mover: stm,
+                    mv: sm.mv,
+                    gave_check: in_check(&board.board, opponent(stm)),
+                    before,
+                });
+                let eval = match self.repetition_value(ply + 1) {
+                    Some(v) => v,
+                    None => self.alphabeta(board, d - 1, ply + 1, false, alpha, beta),
                 };
+                self.search_nodes.pop();
                 board.undo_move(&sm.mv, &undo);
 
                 if eval > max_eval {
@@ -2297,15 +2477,20 @@ impl AI {
         } else {
             let mut min_eval = i32::MAX;
             for sm in &scored_moves {
+                let before = board.board;
                 let undo = board.apply_move(&sm.mv);
-                let eval = if self.is_repetition(board) {
-                    0
-                } else {
-                    self.search_path.push(board.zobrist_hash);
-                    let s = self.alphabeta(board, d - 1, ply + 1, true, alpha, beta);
-                    self.search_path.pop();
-                    s
+                self.search_nodes.push(SearchNode {
+                    hash: board.zobrist_hash,
+                    mover: stm,
+                    mv: sm.mv,
+                    gave_check: in_check(&board.board, opponent(stm)),
+                    before,
+                });
+                let eval = match self.repetition_value(ply + 1) {
+                    Some(v) => v,
+                    None => self.alphabeta(board, d - 1, ply + 1, true, alpha, beta),
                 };
+                self.search_nodes.pop();
                 board.undo_move(&sm.mv, &undo);
 
                 if eval < min_eval {
@@ -2618,9 +2803,9 @@ impl Game {
         if self.red_is_ai || self.black_is_ai {
             println!("\n{}AI难度级别说明:{}", yellow, reset);
             println!("1. 初级 - 简单启发式（不搜索）");
-            println!("2. 中级 - Alpha-Beta 搜索深度 2");
-            println!("3. 高级 - Alpha-Beta 搜索深度 3");
-            println!("4. 专家 - 迭代深化 + 静态搜索（约1秒）\n");
+            println!("2. 中级 - 迭代深化至 4 层（约1秒）");
+            println!("3. 高级 - 迭代深化至 6 层（约1秒）");
+            println!("4. 专家 - 迭代深化至 8 层（约1秒）\n");
 
             if self.red_is_ai {
                 print!("{}选择红方AI难度 (1-4): {}", gamekit::color::RED, reset);
@@ -3342,4 +3527,95 @@ mod tests {
         assert!(!b.is_move_legal(3, 4, 3, 5)); // 未过河卒不可横走
         assert!(b.is_move_legal(3, 4, 4, 4)); // 未过河卒可直进
     }
+    /// 回归：单步“循环”不能被误判成长将。
+    ///
+    /// 曾经 `analyze_repetition` 缺少“三次重复”的前置条件：吃子后历史被清空，
+    /// 只剩最后一步将军时，`red_checks == red_moves == 1` 会被判成“红方长将”，
+    /// 于是出现「红方长将，判负」和「红方获胜」同时打印的矛盾。
+    #[test]
+    fn checkmate_reason_is_not_misreported_as_perpetual() {
+        // 黑将(0,3) 被红车照将，(0,4) 会造成将帅照面，(1,3)/(0,2) 被红马控制 -> 将死
+        let mut b = empty_board();
+        put(&mut b, 9, 4, PieceType::General, PieceColor::Red);
+        put(&mut b, 2, 1, PieceType::Horse, PieceColor::Red);
+        put(&mut b, 5, 0, PieceType::Chariot, PieceColor::Red);
+        put(&mut b, 0, 3, PieceType::General, PieceColor::Black);
+        finish(&mut b);
+
+        assert!(b.make_move(&Move::from_pos(5, 0, 5, 3), PieceColor::Red));
+        assert_eq!(b.get_repetition_count(), 1); // 根本没有重复
+        assert_eq!(b.check_game_state(PieceColor::Black), GameState::RedWin);
+        let reason = b.win_reason(PieceColor::Black);
+        assert!(reason.contains("将死"), "实际原因: {}", reason);
+        assert!(!reason.contains("长将"), "实际原因: {}", reason);
+    }
+
+    /// AI 必须能识别“走这步会让自己因长将/长捉被判负”
+    #[test]
+    fn ai_detects_self_forfeit() {
+        // 红车(2,3)<->(2,4) 反复照将黑将(0,4)<->(0,3)，走满两轮后重复计数到 3
+        let mut b = empty_board();
+        put(&mut b, 9, 5, PieceType::General, PieceColor::Red);
+        put(&mut b, 2, 3, PieceType::Chariot, PieceColor::Red);
+        put(&mut b, 0, 4, PieceType::General, PieceColor::Black);
+        finish(&mut b);
+
+        let cycle = [
+            (PieceColor::Red, 2, 3, 2, 4),
+            (PieceColor::Black, 0, 4, 0, 3),
+            (PieceColor::Red, 2, 4, 2, 3),
+            (PieceColor::Black, 0, 3, 0, 4),
+        ];
+        for _ in 0..2 {
+            for &(side, fr, fc, tr, tc) in &cycle {
+                assert!(b.make_move(&Move::from_pos(fr, fc, tr, tc), side));
+            }
+        }
+        assert_eq!(b.get_repetition_count(), 3);
+
+        // 红方再照将 -> 自己长将判负，必须被识别出来
+        let red_ai = AI::new(PieceColor::Red, AIDifficulty::Level1);
+        assert!(red_ai.would_self_forfeit(&b, &Move::from_pos(2, 3, 2, 4)));
+        // 黑方只是应将，不算违规
+        let black_ai = AI::new(PieceColor::Black, AIDifficulty::Level1);
+        assert!(!black_ai.would_self_forfeit(&b, &Move::from_pos(0, 4, 0, 3)));
+    }
+
+    /// 端到端：在已经形成长将循环的局面下，AI 最终选出的着法不得让自己违规
+    #[test]
+    fn ai_avoids_perpetual_check_move() {
+        let mut b = empty_board();
+        put(&mut b, 9, 5, PieceType::General, PieceColor::Red);
+        put(&mut b, 2, 3, PieceType::Chariot, PieceColor::Red);
+        put(&mut b, 6, 0, PieceType::Soldier, PieceColor::Red);
+        put(&mut b, 0, 4, PieceType::General, PieceColor::Black);
+        put(&mut b, 3, 8, PieceType::Chariot, PieceColor::Black);
+        finish(&mut b);
+
+        let cycle = [
+            (PieceColor::Red, 2, 3, 2, 4),
+            (PieceColor::Black, 0, 4, 0, 3),
+            (PieceColor::Red, 2, 4, 2, 3),
+            (PieceColor::Black, 0, 3, 0, 4),
+        ];
+        for _ in 0..2 {
+            for &(side, fr, fc, tr, tc) in &cycle {
+                assert!(b.make_move(&Move::from_pos(fr, fc, tr, tc), side));
+            }
+        }
+        assert_eq!(b.get_repetition_count(), 3);
+
+        let mut ai = AI::new(PieceColor::Red, AIDifficulty::Level3);
+        let mv = ai.get_best_move(&mut b);
+        assert!(
+            !ai.would_self_forfeit(&b, &mv),
+            "AI 选出了会让自己因长将被判负的着法: ({},{})->({},{})",
+            mv.from_row,
+            mv.from_col,
+            mv.to_row,
+            mv.to_col
+        );
+    }
 }
+
+
