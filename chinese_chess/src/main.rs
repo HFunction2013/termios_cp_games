@@ -3221,6 +3221,32 @@ impl Game {
         (s, layout)
     }
 
+    /// 检查指定棋子是否有至少一步合法走法（用于将军时限制可选棋子）。
+    fn piece_has_legal_move(&self, r: i32, c: i32) -> bool {
+        self.board
+            .get_all_legal_moves(self.current_player)
+            .iter()
+            .any(|m| m.from_row == r && m.from_col == c)
+    }
+
+    /// 检查指定棋子是否有因“走后己方被将军/飞将”而被过滤掉的伪合法走法。
+    /// 用于选中棋子时给出提示（典型场景：过河卒横走会造成将帅照面）。
+    fn piece_has_filtered_moves(&self, r: i32, c: i32) -> bool {
+        let pseudo_count = self
+            .board
+            .generate_pseudo_legal_moves(self.current_player)
+            .into_iter()
+            .filter(|m| m.from_row == r && m.from_col == c)
+            .count();
+        let legal_count = self
+            .board
+            .get_all_legal_moves(self.current_player)
+            .into_iter()
+            .filter(|m| m.from_row == r && m.from_col == c)
+            .count();
+        pseudo_count > legal_count
+    }
+
     /// 执行走子：落子、记录日志、换手、终局判定，结果写入 status。返回是否成功。
     fn commit_move_mouse(&mut self, mv: Move) -> bool {
         let from_piece = self.board.get_piece(mv.from_row, mv.from_col);
@@ -3406,12 +3432,24 @@ impl Game {
                     match selected {
                         None => {
                             if piece.color == self.current_player {
-                                selected = Some((r, c));
-                                self.status = format!(
-                                    "已选中 {}（{}），点击蓝色落点走子",
-                                    piece.name(),
-                                    color_name(self.current_player)
-                                );
+                                let in_check = self.board.is_in_check(self.current_player);
+                                if in_check && !self.piece_has_legal_move(r, c) {
+                                    self.status = format!(
+                                        "被将军！{}无法解将，请选择其他可移动的棋子",
+                                        piece.name()
+                                    );
+                                } else {
+                                    selected = Some((r, c));
+                                    let mut msg = format!(
+                                        "已选中 {}（{}），点击蓝色落点走子",
+                                        piece.name(),
+                                        color_name(self.current_player)
+                                    );
+                                    if self.piece_has_filtered_moves(r, c) {
+                                        msg.push_str("（部分走法因会造成己方被将军/将帅照面而不可用）");
+                                    }
+                                    self.status = msg;
+                                }
                             }
                         }
                         Some((sr, sc)) => {
@@ -3421,12 +3459,24 @@ impl Game {
                                     selected = None;
                                     self.status.clear();
                                 } else {
-                                    selected = Some((r, c));
-                                    self.status = format!(
-                                        "已切换到 {}（{}）",
-                                        piece.name(),
-                                        color_name(self.current_player)
-                                    );
+                                    let in_check = self.board.is_in_check(self.current_player);
+                                    if in_check && !self.piece_has_legal_move(r, c) {
+                                        self.status = format!(
+                                            "被将军！{}无法解将，请选择其他可移动的棋子",
+                                            piece.name()
+                                        );
+                                    } else {
+                                        selected = Some((r, c));
+                                        let mut msg = format!(
+                                            "已切换到 {}（{}）",
+                                            piece.name(),
+                                            color_name(self.current_player)
+                                        );
+                                        if self.piece_has_filtered_moves(r, c) {
+                                            msg.push_str("（部分走法因会造成己方被将军/将帅照面而不可用）");
+                                        }
+                                        self.status = msg;
+                                    }
                                 }
                             } else if self.board.get_all_legal_moves(self.current_player).iter().any(
                                 |m| {
@@ -4103,5 +4153,112 @@ mod tests {
 
         let (board_str2, _) = game.render_mouse(None);
         assert!(!board_str2.contains("\x1b[95m"), "未选中时不应出现紫色");
+    }
+
+    /// 鼠标模式：过河卒应显示横向可落点
+    #[test]
+    fn mouse_render_crossed_soldier_shows_horizontal_dests() {
+        let mut game = Game::new();
+        game.board.board = [[Piece::new(); 9]; 10];
+        put(&mut game.board, 9, 4, PieceType::General, PieceColor::Red);
+        put(&mut game.board, 4, 4, PieceType::Soldier, PieceColor::Red); // 已过河红兵(行4<=4)
+        put(&mut game.board, 0, 3, PieceType::General, PieceColor::Black); // 不同列，避免飞将
+        game.board.zobrist_hash = game.board.compute_zobrist_hash();
+        game.current_player = PieceColor::Red;
+
+        let (board_str, layout) = game.render_mouse(Some((4, 4)));
+        // 过河兵在(4,4)，合法落点应包括：向前(3,4)、向左(4,3)、向右(4,5)
+        let blue_count = board_str.matches("\x1b[94m").count();
+        assert!(
+            blue_count >= 3,
+            "过河兵应有至少3个可落点（向前+左右横走），实际蓝色标记数: {}\n{}",
+            blue_count,
+            board_str
+        );
+
+        // 验证坐标映射：点击(4,3)和(4,5)应能映射到正确格子
+        assert_eq!(layout.cell_at(3 + 4 * 3 + 1, layout.rows[4] as u16), Some((4, 3)));
+        assert_eq!(layout.cell_at(3 + 4 * 5 + 1, layout.rows[4] as u16), Some((4, 5)));
+    }
+
+    /// 鼠标模式：未过河卒不应显示横向可落点
+    #[test]
+    fn mouse_render_uncrossed_soldier_no_horizontal_dests() {
+        let mut game = Game::new();
+        game.board.board = [[Piece::new(); 9]; 10];
+        put(&mut game.board, 9, 4, PieceType::General, PieceColor::Red);
+        put(&mut game.board, 6, 4, PieceType::Soldier, PieceColor::Red); // 未过河红兵(行6>4)
+        put(&mut game.board, 0, 4, PieceType::General, PieceColor::Black);
+        game.board.zobrist_hash = game.board.compute_zobrist_hash();
+        game.current_player = PieceColor::Red;
+
+        let (board_str, _) = game.render_mouse(Some((6, 4)));
+        // 未过河兵在(6,4)，只有向前(5,4)一个落点
+        let blue_count = board_str.matches("\x1b[94m").count();
+        assert_eq!(
+            blue_count, 1,
+            "未过河兵应只有1个可落点（仅向前），实际蓝色标记数: {}\n{}",
+            blue_count, board_str
+        );
+    }
+
+    /// 将军时：只有能解将的棋子才有合法走法，无法解将的棋子应被交互层拒绝选中
+    #[test]
+    fn in_check_only_escaping_pieces_have_legal_moves() {
+        let mut game = Game::new();
+        game.board.board = [[Piece::new(); 9]; 10];
+        // 红帅(9,4)，黑车(5,4)照将；红兵(6,0)无法解将，红仕(9,3)可挡
+        put(&mut game.board, 9, 4, PieceType::General, PieceColor::Red);
+        put(&mut game.board, 9, 3, PieceType::Advisor, PieceColor::Red);
+        put(&mut game.board, 6, 0, PieceType::Soldier, PieceColor::Red);
+        put(&mut game.board, 5, 4, PieceType::Chariot, PieceColor::Black);
+        put(&mut game.board, 0, 4, PieceType::General, PieceColor::Black);
+        game.board.zobrist_hash = game.board.compute_zobrist_hash();
+        game.current_player = PieceColor::Red;
+
+        assert!(game.board.is_in_check(PieceColor::Red), "红方应被将军");
+        // 红兵(6,0)无法解将
+        assert!(
+            !game.piece_has_legal_move(6, 0),
+            "红兵(6,0)无法解将，不应有合法走法"
+        );
+        // 红仕(9,3)可以走到(8,4)挡将
+        assert!(
+            game.piece_has_legal_move(9, 3),
+            "红仕(9,3)应能解将（走到8,4挡将）"
+        );
+        // 红帅(9,4)可以左右移动躲将
+        assert!(
+            game.piece_has_legal_move(9, 4),
+            "红帅(9,4)应能躲将"
+        );
+    }
+
+    /// 过河卒横走会造成将帅照面时，该横走应被过滤，且 piece_has_filtered_moves 应返回 true
+    #[test]
+    fn crossed_soldier_horizontal_move_filtered_by_flying_general() {
+        let mut game = Game::new();
+        game.board.board = [[Piece::new(); 9]; 10];
+        // 红帅(9,4)，黑将(0,4)同列；红兵(4,4)在中间遮挡，横走会造成将帅照面
+        put(&mut game.board, 9, 4, PieceType::General, PieceColor::Red);
+        put(&mut game.board, 4, 4, PieceType::Soldier, PieceColor::Red);
+        put(&mut game.board, 0, 4, PieceType::General, PieceColor::Black);
+        game.board.zobrist_hash = game.board.compute_zobrist_hash();
+        game.current_player = PieceColor::Red;
+
+        // 红兵(4,4)已过河，伪合法走法包括向前+左右横走，但横走会造成将帅照面被过滤
+        assert!(
+            game.piece_has_filtered_moves(4, 4),
+            "红兵(4,4)横走会造成将帅照面，应有被过滤的走法"
+        );
+        // 只有向前(3,4)是合法的（仍保持遮挡）
+        let legal: Vec<(i32, i32)> = game
+            .board
+            .get_all_legal_moves(PieceColor::Red)
+            .into_iter()
+            .filter(|m| m.from_row == 4 && m.from_col == 4)
+            .map(|m| (m.to_row, m.to_col))
+            .collect();
+        assert_eq!(legal, vec![(3, 4)], "红兵(4,4)应只能向前走以保持遮挡");
     }
 }
